@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,56 @@ import (
 	"testing"
 	"time"
 )
+
+func TestRenameDevicePersistenceAndValidation(t *testing.T) {
+	dir := t.TempDir()
+	token := strings.Repeat("a", 43)
+	path := filepath.Join(dir, "devices.db")
+	m, err := Open(token, "", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, session, _, err := m.LoginDevice("test", token, "Android · Chrome", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, label := range []string{"", " \n\t", strings.Repeat("界", 121)} {
+		if err := m.RenameDevice(d.ID, label); !errors.Is(err, ErrInvalidDeviceLabel) {
+			t.Fatalf("invalid name accepted: %v", err)
+		}
+	}
+	if err := m.RenameDevice("missing", "Phone"); !errors.Is(err, ErrDeviceNotFound) {
+		t.Fatal(err)
+	}
+	if err := m.RenameDevice(d.ID, strings.Repeat("界", 120)); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RenameDevice(d.ID, "  iPhone   13 Pro\n"); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Devices(session)[0]; got.Label != "iPhone 13 Pro" || got.Secret != d.Secret || !m.Valid(session) {
+		t.Fatal("rename changed device access or failed to normalize")
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Open(token, "", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := m.Devices("")[0].Label; got != "iPhone 13 Pro" {
+		t.Fatalf("name not persisted: %q", got)
+	}
+	if err := m.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RenameDevice(d.ID, "Unsaved name"); err == nil {
+		t.Fatal("expected closed database error")
+	}
+	if got := m.Devices("")[0].Label; got != "iPhone 13 Pro" {
+		t.Fatal("failed write changed in-memory name")
+	}
+}
 
 func TestPersistentDeviceRevocationAndRotation(t *testing.T) {
 	dir := t.TempDir()

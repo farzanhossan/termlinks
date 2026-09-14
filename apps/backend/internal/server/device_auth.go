@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -115,6 +116,32 @@ func (s *Server) authEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deviceRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("PATCH /api/devices/{id}", s.requireWebAuth(func(w http.ResponseWriter, r *http.Request) {
+		if !sameOrigin(r) {
+			writeError(w, 403, "cross-origin request rejected")
+			return
+		}
+		var input struct {
+			Label string `json:"label"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		if json.NewDecoder(r.Body).Decode(&input) != nil {
+			writeError(w, 400, "invalid device name")
+			return
+		}
+		if err := s.auth.RenameDevice(r.PathValue("id"), input.Label); err != nil {
+			switch {
+			case errors.Is(err, auth.ErrInvalidDeviceLabel):
+				writeError(w, 400, err.Error())
+			case errors.Is(err, auth.ErrDeviceNotFound):
+				writeError(w, 404, err.Error())
+			default:
+				writeError(w, 503, "could not save device name")
+			}
+			return
+		}
+		w.WriteHeader(204)
+	}))
 	mux.HandleFunc("GET /api/devices", s.requireWebAuth(func(w http.ResponseWriter, r *http.Request) {
 		cookie, _ := r.Cookie(cookieName)
 		writeJSON(w, 200, map[string]any{"devices": s.auth.Devices(cookie.Value)})

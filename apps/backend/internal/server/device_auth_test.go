@@ -16,6 +16,49 @@ import (
 	"termlinks/backend/internal/session"
 )
 
+func TestDeviceRenameHTTP(t *testing.T) {
+	token := strings.Repeat("d", 43)
+	manager := auth.New(token)
+	d, sessionCookie, _, err := manager.LoginDevice("test", token, "Phone", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handlers, err := New(session.NewManager(), manager, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name, id, body, origin string
+		authenticated          bool
+		status                 int
+	}{
+		{"rename", d.ID, `{"label":"  OnePlus  12 "}`, "http://localhost", true, 204},
+		{"empty", d.ID, `{"label":" "}`, "http://localhost", true, 400},
+		{"long", d.ID, `{"label":"` + strings.Repeat("a", 121) + `"}`, "http://localhost", true, 400},
+		{"invalid JSON", d.ID, `{`, "http://localhost", true, 400},
+		{"missing", "missing", `{"label":"Phone"}`, "http://localhost", true, 404},
+		{"signed out", d.ID, `{"label":"Phone"}`, "http://localhost", false, 401},
+		{"cross origin", d.ID, `{"label":"Phone"}`, "http://other.example", true, 403},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			r := httptest.NewRequest("PATCH", "http://localhost/api/devices/"+test.id, strings.NewReader(test.body))
+			r.Header.Set("Origin", test.origin)
+			r.Header.Set("Content-Type", "application/json")
+			if test.authenticated {
+				r.AddCookie(&http.Cookie{Name: cookieName, Value: sessionCookie})
+			}
+			w := httptest.NewRecorder()
+			handlers.WebHandler().ServeHTTP(w, r)
+			if w.Code != test.status {
+				t.Fatalf("status %d, want %d: %s", w.Code, test.status, w.Body.String())
+			}
+		})
+	}
+	if manager.Devices(sessionCookie)[0].Label != "OnePlus 12" {
+		t.Fatal("rename failed or rejected request changed the name")
+	}
+}
+
 func TestDirectDeviceLogoutRevokesRememberedLoginAndClosesStream(t *testing.T) {
 	token := strings.Repeat("d", 43)
 	manager := auth.New(token)

@@ -27,6 +27,7 @@ func TestAllowedRoutes(t *testing.T) {
 	workflowID := "0123456789abcdef01234567"
 	stageID := "89abcdef0123456789abcdef"
 	allowedHTTP := []struct{ method, path string }{
+		{"PATCH", "/api/devices/" + strings.Repeat("a", 43)},
 		{"POST", "/api/logout"},
 		{"GET", "/api/me"},
 		{"GET", "/api/sessions"},
@@ -57,6 +58,9 @@ func TestAllowedRoutes(t *testing.T) {
 		}
 	}
 	for _, test := range []struct{ method, path string }{
+		{"PATCH", "/api/devices/not-an-id"},
+		{"PATCH", "/api/devices/" + strings.Repeat("a", 43) + "/extra"},
+		{"PATCH", "/api/devices/" + strings.Repeat("a", 43) + "?extra=1"},
 		{"PUT", "/api/sessions"},
 		{"GET", "/"},
 		{"GET", "/api/sessions/../../etc/passwd"},

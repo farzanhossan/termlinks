@@ -22,6 +22,8 @@ import { binaryStringToBytes, consumeTouchWheel } from "./terminal-touch";
 import "./style.css";
 import { AuthGeneration } from "./auth-generation";
 import { consumeLoginFragment, openQRScanner, type QRLogin } from "./qr-login";
+import { detectDeviceLabel } from "./device-label";
+import { createProfileAvatar } from "./profile-avatar";
 
 type Session = {
   id: string;
@@ -457,7 +459,7 @@ class EncryptedBridge {
       this.authReject = (error) => { window.clearTimeout(timeout); reject(error); };
     });
     await Promise.all([
-      this.sendEncrypted({ v: 2, type: "authenticate", challenge: this.challenge, remember, label: deviceLabel() }),
+      deviceLabel().then((label) => this.sendEncrypted({ v: 2, type: "authenticate", challenge: this.challenge, remember, label })),
       authenticated,
     ]);
   }
@@ -1278,11 +1280,9 @@ function rememberPortalView(view: PortalView, selected = state.selected, selecte
   catch { /* Private browsing may reject presentation-state storage. */ }
 }
 
-function deviceLabel(): string {
-  const ua = navigator.userAgent;
-  const platform = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? "iPad" : /Android/.test(ua) ? "Android" : /Macintosh/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : "Linux";
-  const browser = /Firefox|FxiOS/.test(ua) ? "Firefox" : /Edg/.test(ua) ? "Edge" : /Chrome|CriOS/.test(ua) ? "Chrome" : /Safari/.test(ua) ? "Safari" : "Browser";
-  return `${platform} · ${browser}${window.matchMedia("(display-mode: standalone)").matches ? " app" : ""}`;
+let detectedDeviceLabel: Promise<string> | undefined;
+function deviceLabel(): Promise<string> {
+  return detectedDeviceLabel ??= detectDeviceLabel(navigator, window.matchMedia("(display-mode: standalone)").matches);
 }
 
 function beginManualPortalLogin(): number {
@@ -1302,7 +1302,10 @@ async function loginPortal(token: string, remember: boolean): Promise<void> {
   const generation = authGeneration.current();
   loginAbort?.abort(); loginAbort = new AbortController();
   if (!encryptedPortal) {
-    await api("/api/login", { method: "POST", signal: loginAbort.signal, body: JSON.stringify({ token, remember, label: deviceLabel() }) });
+    const signal = loginAbort.signal;
+    const label = await deviceLabel();
+    authGeneration.assert(generation);
+    await api("/api/login", { method: "POST", signal, body: JSON.stringify({ token, remember, label }) });
     authGeneration.assert(generation);
     try { localStorage.removeItem(LOGGED_OUT_KEY); } catch { /* Storage may be unavailable. */ }
     return;
@@ -1402,32 +1405,84 @@ function handleScannedLogin(value: QRLogin): void {
 type ConnectedDevice = { id: string; label: string; createdAt: string; lastSeen: string; online: boolean; current: boolean };
 
 function createProfileMenu(): HTMLButtonElement {
-  const button = el("button", "ghost-button profile-button", "Profile");
+  const button = el("button", "ghost-button profile-button");
+  button.append(createProfileAvatar());
+  button.setAttribute("aria-label", "Profile"); button.title = "Profile";
   button.type = "button"; button.setAttribute("aria-haspopup", "dialog");
   button.addEventListener("click", () => {
     const dialog = el("dialog", "profile-dialog");
-      dialog.setAttribute("aria-label", "Profile");
+    dialog.setAttribute("aria-label", "Profile");
     const title = el("h2", undefined, "Profile");
     const content = el("div", "profile-content");
     const devices = el("button", "profile-action", "Connected devices");
     const logout = el("button", "profile-action danger", "Log out");
     const close = el("button", "ghost-button", "Close");
     let refresh = 0;
+    let editing = false;
+    let loading = false;
+    let listVersion = 0;
+    let focusDevice = "";
     const cleanup = (): void => { window.clearInterval(refresh); dialog.remove(); };
     close.addEventListener("click", () => { dialog.close(); cleanup(); });
     dialog.addEventListener("close", cleanup);
     logout.addEventListener("click", () => { cleanup(); void logoutPortal(); });
     const showDevices = async (): Promise<void> => {
+      if (editing || loading) return;
+      loading = true;
+      const version = listVersion;
       title.textContent = "Connected devices";
       dialog.setAttribute("aria-label", "Connected devices");
       try {
         const response = await api<{ devices: ConnectedDevice[] }>("/api/devices");
-        if (!dialog.isConnected || !state.authenticated) return;
+        if (!dialog.isConnected || !state.authenticated || editing || version !== listVersion) return;
         const list = el("div", "device-list");
+        let focusTarget: HTMLButtonElement | undefined;
         for (const device of response.devices) {
           const row = el("section", "device-row");
           const details = el("div", "device-details");
           details.append(el("strong", undefined, device.label + (device.current ? " · This device" : "")), el("p", undefined, `${device.online ? "Online" : "Offline"} · Last active ${new Date(device.lastSeen).toLocaleString()}`), el("small", undefined, `Added ${new Date(device.createdAt).toLocaleDateString()}`));
+          const actions = el("div", "device-actions");
+          const rename = el("button", "ghost-button", "Rename");
+          rename.type = "button";
+          rename.setAttribute("aria-label", `Rename ${device.label}`);
+          if (device.id === focusDevice) focusTarget = rename;
+          rename.addEventListener("click", () => {
+            if (editing) return;
+            editing = true; listVersion++;
+            const form = el("form", "device-rename-form");
+            const input = el("input", "device-name-input");
+            input.value = device.label; input.required = true;
+            input.setAttribute("aria-label", "Device name");
+            const save = el("button", "ghost-button", "Save"); save.type = "submit";
+            const cancel = el("button", "ghost-button", "Cancel"); cancel.type = "button";
+            const error = el("p", "form-error"); error.setAttribute("role", "alert");
+            const finish = (): void => {
+              editing = false; focusDevice = device.id; form.remove(); actions.hidden = false;
+              rename.focus(); void showDevices();
+            };
+            cancel.addEventListener("click", finish);
+            input.addEventListener("keydown", (event) => {
+              if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); if (!save.disabled) finish(); }
+            });
+            form.addEventListener("submit", async (event) => {
+              event.preventDefault();
+              const label = input.value.trim().replace(/\s+/gu, " ");
+              if (!label || Array.from(label).length > 120) { error.textContent = "Use a device name of 1–120 characters."; return; }
+              save.disabled = true; cancel.disabled = true; input.disabled = true; error.textContent = "";
+              try {
+                await api(`/api/devices/${encodeURIComponent(device.id)}`, { method: "PATCH", body: JSON.stringify({ label }) });
+                if (dialog.isConnected && state.authenticated) finish();
+              } catch (caught) {
+                if (dialog.isConnected) {
+                  error.textContent = caught instanceof Error ? caught.message : "Could not save device name";
+                  save.disabled = false; cancel.disabled = false; input.disabled = false;
+                }
+              }
+            });
+            const controls = el("div", "device-rename-controls"); controls.append(save, cancel);
+            form.append(input, controls, error); details.append(form); actions.hidden = true;
+            input.focus(); input.select();
+          });
           const remove = el("button", "ghost-button danger", "Remove");
           remove.addEventListener("click", async () => {
             if (!window.confirm(`Remove ${device.label}? Its saved access will stop immediately. The current shared token can still be used to sign in again.`)) return;
@@ -1437,10 +1492,15 @@ function createProfileMenu(): HTMLButtonElement {
               await api(`/api/devices/${encodeURIComponent(device.id)}`, { method: "DELETE" }); await showDevices();
             } catch (error) { remove.disabled = false; window.alert(error instanceof Error ? error.message : "Could not remove device"); }
           });
-          row.append(details, remove); list.append(row);
+          actions.append(rename, remove); row.append(details, actions); list.append(row);
         }
-        content.replaceChildren(el("p", "device-explanation", "Each entry is a browser or installed app. Rotate your portal token if someone else knows it."), list);
-      } catch (error) { if (dialog.isConnected) content.replaceChildren(el("p", "form-error", error instanceof Error ? error.message : "Could not load devices")); }
+        content.replaceChildren(el("p", "device-explanation", "Each entry is a browser or installed app. Rename a device if its model isn’t detected. Rotate your portal token if someone else knows it."), list);
+        focusTarget?.focus(); focusDevice = "";
+      } catch (error) { if (dialog.isConnected && !editing && version === listVersion) content.replaceChildren(el("p", "form-error", error instanceof Error ? error.message : "Could not load devices")); }
+      finally {
+        loading = false;
+        if (version !== listVersion && !editing && dialog.isConnected && state.authenticated) void showDevices();
+      }
     };
     devices.addEventListener("click", () => { void showDevices(); if (!refresh) refresh = window.setInterval(() => { void showDevices(); }, 15000); });
     content.append(devices, logout); dialog.append(title, content, close); document.body.append(dialog); dialog.showModal();

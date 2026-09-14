@@ -1602,7 +1602,7 @@ func allowedHTTPRoute(method, requestPath string) bool {
 	if (method == http.MethodGet && path == "/api/devices") || (method == http.MethodPost && path == "/api/devices/heartbeat") {
 		return true
 	}
-	if method == http.MethodDelete && strings.HasPrefix(path, "/api/devices/") {
+	if (method == http.MethodDelete || method == http.MethodPatch) && strings.HasPrefix(path, "/api/devices/") {
 		id := strings.TrimPrefix(path, "/api/devices/")
 		return len(id) == 43 && !strings.Contains(id, "/")
 	}

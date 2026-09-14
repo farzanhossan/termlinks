@@ -175,6 +175,16 @@ func TestDeviceBridgeRevocationRotationAndSubscriptionLoss(t *testing.T) {
 	}
 	sendOuter(encryptedOuterMessage{Type: "e2e_from_browser", ID: legacyID, Data: legacyPacket})
 	a, b := register("a"), register("b")
+	send(a, httpRequestMessage{Version: protocolVersion, Type: "http_request", ID: "44444444-4444-4444-8444-444444444444", Method: "PATCH", Path: "/api/devices/" + b.id, Body: `{"label":"iPhone 13 Pro"}`})
+	var renamed httpResponseMessage
+	if err = json.Unmarshal(readPacket(a), &renamed); err != nil || renamed.Status != 204 {
+		t.Fatalf("encrypted rename failed: %d %v", renamed.Status, err)
+	}
+	for _, device := range authentication.Devices("") {
+		if device.ID == b.id && device.Label != "iPhone 13 Pro" {
+			t.Fatal("encrypted rename was not persisted")
+		}
+	}
 	if !closed[legacyID] {
 		t.Fatal("legacy unscoped authentication was accepted")
 	}

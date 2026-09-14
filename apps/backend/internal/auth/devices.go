@@ -239,6 +239,30 @@ func (m *Manager) Touch(session string) error {
 	return nil
 }
 
+var ErrInvalidDeviceLabel = errors.New("device name must contain 1–120 characters")
+var ErrDeviceNotFound = errors.New("device not found")
+
+func (m *Manager) RenameDevice(id, label string) error {
+	label = strings.Join(strings.Fields(label), " ")
+	if len([]rune(label)) < 1 || len([]rune(label)) > 120 {
+		return ErrInvalidDeviceLabel
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	d, ok := m.devices[id]
+	if !ok {
+		return ErrDeviceNotFound
+	}
+	if m.db != nil {
+		if _, err := m.db.Exec(`UPDATE devices SET label=? WHERE id=?`, label, id); err != nil {
+			return err
+		}
+	}
+	d.Label = label
+	m.devices[id] = d
+	return nil
+}
+
 func (m *Manager) Revoke(id string) error {
 	m.changeMu.Lock()
 	defer m.changeMu.Unlock()

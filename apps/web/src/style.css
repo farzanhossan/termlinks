@@ -835,6 +835,19 @@ button { color: inherit; }
 }
 
 /* Device access and camera dialogs share the portal's existing controls. */
+.profile-button { display: grid; place-items: center; flex: 0 0 44px; width: 44px; height: 44px; margin-left: auto; padding: 5px; border-radius: 50%; }
+.profile-button:hover { background: #ffffff12; }
+.profile-button:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.profile-avatar { display: block; width: 34px; height: 34px; border-radius: 50%; border: 1px solid #ffffff30; }
+.workflow-topbar, .team-room-topbar { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+.terminal-header { grid-template-columns: 40px minmax(0, 1fr) auto 44px; }
+.desktop-header { grid-template-columns: 54px minmax(0, 1fr) 82px 44px; }
+.device-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.device-actions[hidden] { display: none; }
+.device-rename-form { display: grid; gap: 8px; margin-top: 12px; }
+.device-name-input { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--ink); font: inherit; }
+.device-rename-controls { display: flex; gap: 8px; }
+.device-rename-form .form-error:empty { display: none; }
 .profile-dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); overflow: auto; padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); color: var(--ink); box-shadow: 0 24px 80px #0005; }
 .profile-dialog::backdrop { background: #0b171ca8; }
 .profile-dialog h2 { margin: 0 0 18px; font-size: 22px; }
@@ -848,4 +861,9 @@ button { color: inherit; }
 .scanner-dialog video { display: block; width: 100%; max-height: 42dvh; background: #14221a; border-radius: 12px; }
 .scanner-dialog > button, .scanner-dialog > input { display: block; margin-top: 16px; }
 .qr-scan-button { width: 100%; margin-top: 12px; }
-@media (max-width: 480px) { .profile-dialog { padding: 18px; } .profile-button { padding: 8px; font-size: 12px; } }
+@media (max-width: 480px) {
+  .profile-dialog { padding: 18px; }
+  .device-actions { flex-direction: column; }
+  .workflow-topbar .workflow-private-badge { display: none; }
+  .workflow-topbar { grid-template-columns: auto minmax(0, 1fr) auto; }
+}
