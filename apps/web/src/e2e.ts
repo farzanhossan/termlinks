@@ -4,7 +4,7 @@ const decoder = new TextDecoder();
 export type E2EDirection = "browser" | "connector";
 
 export async function deriveEncryptionKey(token: string): Promise<CryptoKey> {
-  const material = await crypto.subtle.digest("SHA-256", encoder.encode(`termlinks-e2e-v1\u0000${token}`));
+  const material = await crypto.subtle.digest("SHA-256", encoder.encode(`termlinks-e2e-v2\u0000${token}`));
   return crypto.subtle.importKey("raw", material, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
 }
 
@@ -72,7 +72,7 @@ export function base64URLToBytes(value: string): Uint8Array {
 }
 
 function encryptionAAD(channel: string, direction: E2EDirection, sequence: Uint8Array): Uint8Array {
-  const prefix = encoder.encode(`termlinks-e2e-v1:${channel}:${direction}:`);
+  const prefix = encoder.encode(`termlinks-e2e-v2:${channel}:${direction}:`);
   const aad = new Uint8Array(prefix.byteLength + sequence.byteLength);
   aad.set(prefix);
   aad.set(sequence, prefix.byteLength);

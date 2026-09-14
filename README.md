@@ -25,7 +25,7 @@ Termlinks is a **developer preview** intended for one trusted owner and trusted 
 | Full-desktop access | Local Screen Sharing/VNC required | User-supplied loopback VNC server required | Not implemented |
 | Selected-window capture and control | macOS 14+ only | Unavailable | Unavailable |
 
-Managed PTYs survive browser/PWA disconnects and connector restarts, but they currently do **not** survive a Termlinks daemon restart or computer reboot. One hosted deployment maps to one configured computer; device pairing, revocation, and multi-computer routing remain roadmap work.
+Managed PTYs survive browser/PWA disconnects and connector restarts, but they currently do **not** survive a Termlinks daemon restart or computer reboot. One hosted deployment maps to one configured computer; browser-device registration and revocation are supported; multi-computer routing remains roadmap work.
 
 ## Install
 
@@ -253,16 +253,38 @@ The state directory is created with mode `0700`; sensitive files are forced to `
 | `cloud.log` | Detached connector diagnostics. It should not contain tokens, but still treat logs as private. |
 | `workflows.db`, `workflows.db-wal`, `workflows.db-shm` | Local SQLite team-room messages, workflow stages, projects, events, and bounded agent-output state. Each file is forced to `0600`. |
 | `terminal-history.db`, `terminal-history.db-wal`, `terminal-history.db-shm` | Local SQLite terminal names, working directories, favorites, and open/close timestamps. Command arguments, terminal input, and terminal output are never stored here. Each file is forced to `0600`. |
+| `devices.db` | Private `0600` registry of device credentials, token generations, labels and activity. Credentials are secrets; do not share or back up this file publicly. |
+| `portal.url`, `auth.lock` | Saved QR destination and authentication ownership lock. |
 | `workflow-artifacts/` | Private `0700` directory reserved for workflow-generated artifacts. |
 | `workflow-worktrees/` | Private `0700` directory reserved for isolated Git worktrees in a later workflow phase. The current release serializes work in the same repository instead. |
 
 On macOS the default directory is normally `~/Library/Application Support/termlinks`. On Linux it follows the user config directory, normally `$XDG_CONFIG_HOME/termlinks` or `~/.config/termlinks`. Do not commit this directory.
 
-The portal token is not a configurable password string: Termlinks generates it, and `termlinks token` displays the same stored value. To rotate it, first stop the daemon so all in-memory sessions have ended, move `auth.token` to a private backup or trash, and start Termlinks to generate a new token. Existing browser sessions then stop authenticating after their current cookie expires or the daemon restarts.
+`termlinks token` displays the same saved token each time. To replace it and immediately revoke every device, run:
+
+```sh
+termlinks token --rotate
+```
+
+Rotation closes browser terminal, desktop, window, and upload connections without stopping managed terminal processes. Everyone must sign in again with the new token. The old token and QR code cannot grant access. This requires an updated running daemon; if an older daemon is holding active terminals, finish that work before restarting it to activate the upgrade.
+
+For phone-camera login, configure your own browser portal URL once:
+
+```sh
+termlinks token --url https://your-portal.example
+```
+
+Interactive terminals display the token and a QR code. Later `termlinks token` and `termlinks token --rotate` reuse that URL. Without a URL, the QR contains only the token and can be read with the portal's **Scan QR** option. The connector's Worker URL is not necessarily the browser portal URL. `--no-qr` suppresses the QR, and redirected stdout remains token-only.
+
+The login screen supports **Scan QR**, choosing a QR image, and manual token entry. Camera access requires HTTPS (or a browser-trusted local origin). A QR targeting another portal shows its destination before navigation. Treat the QR as a password: it contains the shared token in a URL fragment, which the app removes immediately on opening.
+
+Open **Profile → Connected devices** to see registered browsers/apps, recent activity, and **This device**. **Remove** revokes that device's credential and closes its connections. Other devices keep working. A person who still knows your shared token can register again, so rotate the token if it has leaked. A browser and an installed PWA may appear as separate devices when their storage is separate.
+
+**Profile → Log out** revokes the current device credential, clears its remembered login, and returns to login. Logout is synchronized across tabs. Offline logout clears local access and prevents automatic restoration; if the computer could not confirm revocation, remove that device from another signed-in device when possible.
 
 The login form exposes standard username/current-password metadata so Safari, Chrome, an installed PWA, and the operating system password manager can offer to save and autofill the portal token. Save it under the generated `termlinks` username. Face ID or device-lock confirmation is controlled by iOS and the selected password manager; Termlinks never receives biometric data and cannot force the prompt.
 
-In the hosted E2E portal, **Keep me signed in on this device** is enabled by default. After successful authentication, Termlinks stores the derived, non-exportable AES-GCM `CryptoKey` in origin-scoped IndexedDB—not the raw token. If iOS suspends or terminates the PWA, it uses that key to reconnect automatically and restores the previously open terminal when possible. **Log out** deletes the stored key. Clearing website data also deletes it. Uncheck the option on a shared or untrusted device.
+In the hosted E2E portal, **Keep me signed in on this device** is enabled by default. After successful authentication, Termlinks stores a separate device credential as a non-exportable AES-GCM `CryptoKey` in origin-scoped IndexedDB—not the shared token or its derived key. If iOS suspends or terminates the PWA, it uses that key to reconnect automatically and restores the previously open terminal when possible. **Log out** deletes the stored key. Clearing website data also deletes it. Uncheck the option on a shared or untrusted device.
 
 ### Local AI team rooms (experimental)
 
@@ -332,7 +354,7 @@ printf '%s' '<random-connector-secret>' | \
 | `termlinks cloud stop` | Stops only the connector; managed PTYs remain running. |
 | `termlinks cloud connect` | Internal foreground entry point used by `cloud start`; normally do not invoke it manually. |
 
-The connector token authenticates the computer to the relay. The portal token authenticates and derives the browser E2E key. They are deliberately different and must never be substituted for each other.
+The connector token authenticates the computer to the relay. The portal token authenticates device registration; an issued device key protects subsequent browser traffic. They are deliberately different and must never be substituted for each other.
 
 ### Remote desktop and selected windows
 
@@ -593,11 +615,11 @@ Selected-window access also stops immediately when `termlinks desktop disable` d
 
 - Anyone with the portal token has full control of managed terminals and, while the desktop tunnel is enabled, can attempt to access the GUI. Treat the token like an administrator password and do not send it in chat, screenshots, source code, or logs.
 - Termlinks restricts its VNC destination to a loopback address, but enabling macOS Screen Sharing can also expose the service to the Mac's local network. Restrict allowed macOS users, use strong credentials, keep the firewall enabled, and disable Screen Sharing when it is not needed.
-- The portal token derives the AES-256-GCM bridge key in the browser. Cloudflare carries encrypted terminal and desktop payloads and cannot read their contents, although normal connection metadata remains visible.
+- The portal token authenticates device registration; a separate device key encrypts subsequent AES-256-GCM bridge traffic. Cloudflare carries encrypted terminal and desktop payloads and cannot read their contents, although normal connection metadata remains visible.
 - VNC credentials are supplied directly to the in-browser VNC client for the live connection. Termlinks does not save them.
 - Selected-window titles, application names, captured frames, and control events are encrypted inside the same bridge. Cloudflare receives ciphertext, sizes, timing, and ordinary connection metadata only.
 - Uploaded filenames and file bytes are chunked inside that same authenticated AES-256-GCM bridge. Cloudflare can observe transfer timing and ciphertext sizes but not names or contents.
-- A remembered hosted-portal login stores a non-exportable derived bridge key in that Pages origin's IndexedDB. It avoids storing the raw token, but it is still an authentication capability: anyone able to use the unlocked PWA can control the connected computer. Use explicit **Log out** before sharing the phone and do not enable remembering on an untrusted device.
+- A remembered hosted-portal login stores a non-exportable device bridge key in that Pages origin's IndexedDB. It avoids storing the raw token, but it is still an authentication capability: anyone able to use the unlocked PWA can control the connected computer. Use explicit **Log out** before sharing the phone and do not enable remembering on an untrusted device.
 - macOS Screen Recording and Accessibility permissions apply to the installed Termlinks executable. Replacing it with an unsigned/differently signed build may require approval again; official local builds use the stable `dev.termlinks.cli` ad-hoc identifier.
 - View-only mode prevents accidental input in the UI; it is a safety control, not an authentication boundary.
 
@@ -627,7 +649,7 @@ termlinks CLI ──┴─ Unix socket ─► daemon ├─ WebSocket ─► pho
                          codex / claude / npm / bash / ...
 ```
 
-For the default Cloudflare public path, the browser derives an AES-256-GCM key from the portal token and opens one encrypted bridge through the owner's Pages deployment. Pages and the Worker relay only ciphertext; the local connector decrypts approved requests and terminal data, then talks to the daemon's configured local listener (`127.0.0.1:57321` on a new installation). The portal token itself never crosses the network, and the local port is never publicly bound.
+For the default Cloudflare public path, the browser uses the portal token to register, then opens an AES-256-GCM encrypted bridge with a separate device credential through the owner's Pages deployment. Pages and the Worker relay only ciphertext; the local connector decrypts approved requests and terminal data, then talks to the daemon's configured local listener (`127.0.0.1:57321` on a new installation). The portal token itself never crosses the network, and the local port is never publicly bound.
 
 Remote desktop uses the same bridge. For a full desktop, browser-side noVNC speaks RFB/VNC through an in-memory WebSocket-like channel; Termlinks encrypts each byte chunk and the connector forwards it only to the configured loopback VNC address. For a selected window, the connector asks macOS ScreenCaptureKit for encrypted source metadata and bounded JPEG frames, then accepts only validated pointer, key, text, and clipboard messages. There is no public VNC port or generic TCP proxy.
 

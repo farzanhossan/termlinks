@@ -30,46 +30,16 @@ func TestCloudPortalEndToEnd(t *testing.T) {
 	websocketURL := *portalURL
 	websocketURL.Scheme = "wss"
 	websocketURL.Path = "/ws/bridge"
-	connection, response, err := (&websocket.Dialer{HandshakeTimeout: 15 * time.Second}).Dial(websocketURL.String(), http.Header{"Origin": {portal}})
-	if err != nil {
-		if response != nil {
-			_ = response.Body.Close()
-			t.Fatalf("encrypted bridge returned HTTP %d: %v", response.StatusCode, err)
-		}
-		t.Fatal(err)
-	}
+	connection, key, channelID, deviceID := connectDeviceForTest(t, websocketURL.String(), portal, token)
 	defer connection.Close()
-	_ = connection.SetReadDeadline(time.Now().Add(20 * time.Second))
-
-	_, readyData, err := connection.ReadMessage()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var ready struct {
-		Type     string `json:"type"`
-		ID       string `json:"id"`
-		Protocol string `json:"protocol"`
-	}
-	if json.Unmarshal(readyData, &ready) != nil || ready.Type != "bridge_ready" || ready.Protocol != "e2e-v1" || !validMessageID(ready.ID) {
-		t.Fatal("relay returned an invalid encrypted-bridge greeting")
-	}
-	key := deriveKey(token)
-	var sendSequence uint32
-	var receiveSequence uint32
-	challenge := base64.RawURLEncoding.EncodeToString([]byte("termlinks-e2e-smoke-challenge"))
-	writeEncryptedForTest(t, connection, key, ready.ID, &sendSequence, authenticateMessage{Version: protocolVersion, Type: "authenticate", Challenge: challenge})
-	var authenticated authenticatedMessage
-	readEncryptedForTest(t, connection, key, ready.ID, &receiveSequence, &authenticated)
-	if authenticated.Type != "authenticated" || authenticated.Challenge != challenge {
-		t.Fatal("connector did not prove possession of the E2E key")
-	}
+	var sendSequence, receiveSequence uint32 = 1, 1
 
 	requestID := "11111111-1111-4111-8111-111111111111"
-	writeEncryptedForTest(t, connection, key, ready.ID, &sendSequence, httpRequestMessage{
+	writeEncryptedForTest(t, connection, key, channelID, deviceID, &sendSequence, httpRequestMessage{
 		Version: protocolVersion, Type: "http_request", ID: requestID, Method: http.MethodGet, Path: "/api/sessions",
 	})
 	var apiResponse httpResponseMessage
-	readEncryptedForTest(t, connection, key, ready.ID, &receiveSequence, &apiResponse)
+	readEncryptedForTest(t, connection, key, channelID, &receiveSequence, &apiResponse)
 	if apiResponse.Type != "http_response" || apiResponse.ID != requestID || apiResponse.Status != http.StatusOK {
 		t.Fatalf("encrypted session listing returned status %d", apiResponse.Status)
 	}
@@ -98,7 +68,7 @@ func TestCloudPortalEndToEnd(t *testing.T) {
 	}
 
 	terminalID := "22222222-2222-4222-8222-222222222222"
-	writeEncryptedForTest(t, connection, key, ready.ID, &sendSequence, terminalOpenMessage{
+	writeEncryptedForTest(t, connection, key, channelID, deviceID, &sendSequence, terminalOpenMessage{
 		Version: protocolVersion, Type: "terminal_open", ID: terminalID, SessionID: targetSession.ID,
 	})
 	input := os.Getenv("TERMLINKS_E2E_SEND")
@@ -106,7 +76,7 @@ func TestCloudPortalEndToEnd(t *testing.T) {
 	var terminalOutput []byte
 	for !opened || len(terminalOutput) == 0 || (input != "" && !bytes.Contains(terminalOutput, []byte(input))) {
 		var raw json.RawMessage
-		readEncryptedForTest(t, connection, key, ready.ID, &receiveSequence, &raw)
+		readEncryptedForTest(t, connection, key, channelID, &receiveSequence, &raw)
 		var kind innerMessageType
 		if json.Unmarshal(raw, &kind) != nil {
 			t.Fatal("connector returned invalid encrypted terminal JSON")
@@ -115,7 +85,7 @@ func TestCloudPortalEndToEnd(t *testing.T) {
 		case "terminal_opened":
 			opened = true
 			if input != "" {
-				writeEncryptedForTest(t, connection, key, ready.ID, &sendSequence, terminalDataMessage{
+				writeEncryptedForTest(t, connection, key, channelID, deviceID, &sendSequence, terminalDataMessage{
 					Version: protocolVersion, Type: "terminal_data", ID: terminalID, Binary: true,
 					Data: base64.RawURLEncoding.EncodeToString([]byte(input + "\n")),
 				})
@@ -138,19 +108,20 @@ func TestCloudPortalEndToEnd(t *testing.T) {
 			t.Fatal("terminal closed before the E2E smoke test completed")
 		}
 	}
-	writeEncryptedForTest(t, connection, key, ready.ID, &sendSequence, terminalCloseMessage{
+	writeEncryptedForTest(t, connection, key, channelID, deviceID, &sendSequence, terminalCloseMessage{
 		Version: protocolVersion, Type: "terminal_close", ID: terminalID, Code: websocket.CloseNormalClosure, Reason: "Smoke test complete",
 	})
 	_ = connection.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Smoke test complete"), time.Now().Add(2*time.Second))
 }
 
-func writeEncryptedForTest(t *testing.T, connection *websocket.Conn, key [32]byte, channel string, sequence *uint32, value any) {
+func writeEncryptedForTest(t *testing.T, connection *websocket.Conn, key [32]byte, channel, deviceID string, sequence *uint32, value any) {
 	t.Helper()
 	packet, err := encryptPacket(key, channel, "browser", *sequence, value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := connection.WriteMessage(websocket.TextMessage, []byte(packet)); err != nil {
+	envelope, _ := json.Marshal(deviceEnvelope{Version: protocolVersion, DeviceID: deviceID, Packet: packet})
+	if err := connection.WriteMessage(websocket.TextMessage, []byte(base64.RawURLEncoding.EncodeToString(envelope))); err != nil {
 		t.Fatal(err)
 	}
 	*sequence++
@@ -178,4 +149,47 @@ func readEncryptedForTest(t *testing.T, connection *websocket.Conn, key [32]byte
 		t.Fatal(err)
 	}
 	*sequence++
+}
+
+func connectDeviceForTest(t *testing.T, websocketURL, portal, token string) (*websocket.Conn, [32]byte, string, string) {
+	t.Helper()
+	secret, id := token, ""
+	for attempt := 0; attempt < 2; attempt++ {
+		connection, response, err := (&websocket.Dialer{HandshakeTimeout: 15 * time.Second}).Dial(websocketURL, http.Header{"Origin": {portal}})
+		if err != nil {
+			if response != nil {
+				t.Fatalf("bridge returned HTTP %d", response.StatusCode)
+			}
+			t.Fatal(err)
+		}
+		_ = connection.SetReadDeadline(time.Now().Add(20 * time.Second))
+		var ready struct{ Type, ID, Protocol string }
+		if err = connection.ReadJSON(&ready); err != nil || ready.Type != "bridge_ready" || ready.Protocol != "e2e-v2" {
+			connection.Close()
+			t.Fatal("invalid bridge greeting", err)
+		}
+		key := deriveKey(secret)
+		var send, receive uint32
+		challenge := "termlinks-device-smoke-challenge"
+		writeEncryptedForTest(t, connection, key, ready.ID, id, &send, authenticateMessage{Version: protocolVersion, Type: "authenticate", Challenge: challenge})
+		var result authenticatedMessage
+		readEncryptedForTest(t, connection, key, ready.ID, &receive, &result)
+		if result.Challenge != challenge || result.Type != "authenticated" {
+			connection.Close()
+			t.Fatal("authentication proof failed")
+		}
+		if id != "" {
+			if result.DeviceID != id {
+				t.Fatal("device identity mismatch")
+			}
+			return connection, key, ready.ID, id
+		}
+		connection.Close()
+		id, secret = result.DeviceID, result.Secret
+		if id == "" || secret == "" {
+			t.Fatal("missing device credential")
+		}
+	}
+	t.Fatal("device login failed")
+	return nil, [32]byte{}, "", ""
 }

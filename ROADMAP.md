@@ -18,7 +18,7 @@ The current trust model is one owner, one configured computer, and trusted clien
 
 ## Near-term priorities
 
-1. Per-device pairing, named devices, revocation, session expiry controls, and a visible security activity log.
+1. Local approval for new devices, editable device names, session expiry controls, and a visible security activity log. Token-based device registration, device revocation, QR login, and token rotation are implemented.
 2. Multiple-computer registration and explicit routing without sharing one connector identity.
 3. A durable session backend or controlled daemon handoff so upgrades and daemon restarts do not end managed PTYs.
 4. Workflow retention controls, cancellation recovery, clearer agent approval boundaries, and isolated Git worktrees.

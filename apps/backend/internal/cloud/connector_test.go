@@ -176,10 +176,9 @@ func TestEncryptedPortalCreatesShellHeadlesslyThroughPrivateControl(t *testing.T
 
 	channelID := "01234567-89ab-cdef-0123-456789abcdef"
 	key := deriveKey(portalToken)
-	channel := &browserChannel{httpClient: httpClient}
+	channel := &browserChannel{selected: true, key: key, httpClient: httpClient}
 	state := &connectionState{
-		ctx: context.Background(), localOrigin: web.URL, control: client.New(socketPath), key: key,
-		outgoing: make(chan []byte, 1), channels: map[string]*browserChannel{channelID: channel},
+		ctx: context.Background(), localOrigin: web.URL, control: client.New(socketPath), outgoing: make(chan []byte, 1), channels: map[string]*browserChannel{channelID: channel},
 	}
 	payload, _ := json.Marshal(map[string]string{"name": "cloud shell", "cwd": t.TempDir()})
 	state.handleHTTPRequest(channelID, channel, httpRequestMessage{
@@ -264,10 +263,9 @@ func TestEncryptedPortalCreationBypassesLegacyWebRoute(t *testing.T) {
 
 	channelID := "01234567-89ab-cdef-0123-456789abcdef"
 	key := deriveKey("abcdefghijklmnopqrstuvwxyz1234567890")
-	channel := &browserChannel{httpClient: legacyWeb.Client()}
+	channel := &browserChannel{selected: true, key: key, httpClient: legacyWeb.Client()}
 	state := &connectionState{
-		ctx: context.Background(), localOrigin: legacyWeb.URL, control: client.New(socketPath), key: key,
-		outgoing: make(chan []byte, 1), channels: map[string]*browserChannel{channelID: channel},
+		ctx: context.Background(), localOrigin: legacyWeb.URL, control: client.New(socketPath), outgoing: make(chan []byte, 1), channels: map[string]*browserChannel{channelID: channel},
 	}
 	payload, _ := json.Marshal(map[string]string{"name": "legacy cloud shell", "cwd": t.TempDir()})
 	state.handleHTTPRequest(channelID, channel, httpRequestMessage{
@@ -324,10 +322,9 @@ func TestEncryptedDesktopBridgesLoopbackVNCBytes(t *testing.T) {
 	channelID := "01234567-89ab-cdef-0123-456789abcdef"
 	desktopID := "11111111-1111-4111-8111-111111111111"
 	key := deriveKey("abcdefghijklmnopqrstuvwxyz1234567890")
-	channel := &browserChannel{desktops: make(map[string]*desktopSocket)}
+	channel := &browserChannel{selected: true, key: key, desktops: make(map[string]*desktopSocket)}
 	state := &connectionState{
 		ctx:            context.Background(),
-		key:            key,
 		outgoing:       make(chan []byte, 8),
 		channels:       map[string]*browserChannel{channelID: channel},
 		desktopEnabled: true,
@@ -382,10 +379,9 @@ func TestEncryptedDesktopIsDisabledByDefault(t *testing.T) {
 	channelID := "01234567-89ab-cdef-0123-456789abcdef"
 	desktopID := "11111111-1111-4111-8111-111111111111"
 	key := deriveKey("abcdefghijklmnopqrstuvwxyz1234567890")
-	channel := &browserChannel{desktops: make(map[string]*desktopSocket)}
+	channel := &browserChannel{selected: true, key: key, desktops: make(map[string]*desktopSocket)}
 	state := &connectionState{
 		ctx:      context.Background(),
-		key:      key,
 		outgoing: make(chan []byte, 1),
 		channels: map[string]*browserChannel{channelID: channel},
 	}
@@ -436,9 +432,9 @@ func TestEncryptedFileUploadIsPrivateOrderedAndDoesNotOverwrite(t *testing.T) {
 	if err := os.WriteFile(existingPath, []byte("existing"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	channel := &browserChannel{uploads: make(map[string]*fileUpload)}
+	channel := &browserChannel{selected: true, key: key, uploads: make(map[string]*fileUpload)}
 	state := &connectionState{
-		ctx: context.Background(), key: key, outgoing: make(chan []byte, 8),
+		ctx: context.Background(), outgoing: make(chan []byte, 8),
 		channels: map[string]*browserChannel{channelID: channel}, uploadDirectory: directory,
 	}
 	content := []byte("%PDF-1.7\nprivate upload\n")
@@ -482,9 +478,9 @@ func TestEncryptedFileUploadRejectsOutOfOrderChunkAndCleansTemporaryFile(t *test
 	uploadID := "11111111-1111-4111-8111-111111111111"
 	key := deriveKey("abcdefghijklmnopqrstuvwxyz1234567890")
 	directory := t.TempDir()
-	channel := &browserChannel{uploads: make(map[string]*fileUpload)}
+	channel := &browserChannel{selected: true, key: key, uploads: make(map[string]*fileUpload)}
 	state := &connectionState{
-		ctx: context.Background(), key: key, outgoing: make(chan []byte, 8),
+		ctx: context.Background(), outgoing: make(chan []byte, 8),
 		channels: map[string]*browserChannel{channelID: channel}, uploadDirectory: directory,
 	}
 	state.startFileUpload(channelID, channel, fileUploadMessage{

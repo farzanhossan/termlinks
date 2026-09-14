@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -86,7 +87,7 @@ func run(args []string) error {
 			}
 			return stopSession(args[1])
 		case "token":
-			return printToken()
+			return printToken(args[1:])
 		case "doctor":
 			return doctor()
 		case "cloud":
@@ -835,10 +836,20 @@ func runDaemon(args []string) error {
 	if err := config.SaveSettings(paths, settings); err != nil {
 		return err
 	}
+	unlockAuth, err := config.LockAuth(paths)
+	if err != nil {
+		return err
+	}
+	defer unlockAuth()
 	token, err := config.LoadOrCreateToken(paths)
 	if err != nil {
 		return err
 	}
+	authManager, err := auth.Open(token, paths.Token, filepath.Join(paths.Dir, "devices.db"))
+	if err != nil {
+		return err
+	}
+	defer authManager.Close()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	manager := session.NewManager()
 	var nativeViewer server.NativeViewer
@@ -846,7 +857,7 @@ func runDaemon(args []string) error {
 		visibleTerminals := visibleterminal.New(paths.Dir)
 		nativeViewer = server.NativeViewer{Open: visibleTerminals.Open, Close: visibleTerminals.Close}
 	}
-	handlers, err := server.New(manager, auth.New(token), logger, nativeViewer)
+	handlers, err := server.New(manager, authManager, logger, nativeViewer)
 	if err != nil {
 		return err
 	}
@@ -1175,23 +1186,6 @@ func stopSession(id string) error {
 	return nil
 }
 
-func printToken() error {
-	paths, err := config.ResolvePaths()
-	if err != nil {
-		return err
-	}
-	if err := config.Ensure(paths); err != nil {
-		return err
-	}
-	token, err := config.LoadOrCreateToken(paths)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(os.Stderr, "Keep this token private. Enter it only in your Termlinks portal.")
-	fmt.Println(token)
-	return nil
-}
-
 func doctor() error {
 	paths, err := config.ResolvePaths()
 	if err != nil {
@@ -1335,7 +1329,8 @@ Usage:
   termlinks show <id>               Open this session in a native terminal
   termlinks hide <id>               Hide its managed native terminal viewer
   termlinks stop <id>               Gracefully stop a session
-  termlinks token                   Print the private portal login token
+  termlinks token [--rotate] [--url <portal-url>] [--no-qr]
+                                   Show token/QR or revoke all devices and rotate
   termlinks doctor                  Show safe local diagnostics
   termlinks update [--local-only] [--restart-daemon]
                                     Update the binary, daemon, connector, and configured Pages

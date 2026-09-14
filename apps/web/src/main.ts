@@ -20,6 +20,8 @@ import { terminalPasteInput } from "./terminal-clipboard";
 import { TerminalReplyGate } from "./terminal-reply-gate";
 import { binaryStringToBytes, consumeTouchWheel } from "./terminal-touch";
 import "./style.css";
+import { AuthGeneration } from "./auth-generation";
+import { consumeLoginFragment, openQRScanner, type QRLogin } from "./qr-login";
 
 type Session = {
   id: string;
@@ -221,10 +223,21 @@ let installPrompt: BeforeInstallPromptEvent | undefined;
 let portalResumeKey: CryptoKey | undefined;
 let portalReconnect: Promise<void> | undefined;
 let portalReconnectTimer = 0;
+let portalDeviceID = "";
+const authGeneration = new AuthGeneration();
+let loginAbort: AbortController | undefined;
+const pendingAuthBridges = new Set<EncryptedBridge>();
+const LOGGED_OUT_KEY = "termlinks-logged-out-v2";
+function wasLoggedOut(): boolean { try { return localStorage.getItem(LOGGED_OUT_KEY) === "true"; } catch { return false; } }
+const authBroadcast = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("termlinks-auth-v2") : undefined;
+let startupQR: QRLogin | undefined;
+let startupQRError = "";
+try { startupQR = consumeLoginFragment(); } catch (error) { startupQRError = error instanceof Error ? error.message : "Invalid QR login"; }
+
 
 const PORTAL_KEY_DATABASE = "termlinks-secure-session";
 const PORTAL_KEY_STORE = "keys";
-const PORTAL_KEY_ID = "portal-e2e-key";
+const PORTAL_KEY_ID = "portal-device-key-v2";
 const TERMINAL_TAB_ORDER_KEY = "termlinks-terminal-tab-order-v1";
 const TERMINAL_INPUT_MODE_KEY = "termlinks-terminal-input-mode-v1";
 const MAX_PERSISTED_TERMINAL_TABS = 64;
@@ -408,12 +421,16 @@ class EncryptedBridge {
   private challenge = "";
   private failed = false;
 
+  deviceID = "";
+  issuedCredential?: { id: string; secret: string };
+
   async connect(token: string): Promise<void> {
     await this.connectWithKey(await deriveEncryptionKey(token));
   }
 
-  async connectWithKey(key: CryptoKey): Promise<void> {
+  async connectWithKey(key: CryptoKey, deviceID = "", remember = true): Promise<void> {
     this.key = key;
+    this.deviceID = deviceID;
     const scheme = location.protocol === "https:" ? "wss:" : "ws:";
     const socket = new WebSocket(`${scheme}//${location.host}/ws/bridge`);
     this.socket = socket;
@@ -439,8 +456,10 @@ class EncryptedBridge {
       this.authResolve = () => { window.clearTimeout(timeout); resolve(); };
       this.authReject = (error) => { window.clearTimeout(timeout); reject(error); };
     });
-    await this.sendEncrypted({ v: 1, type: "authenticate", challenge: this.challenge });
-    await authenticated;
+    await Promise.all([
+      this.sendEncrypted({ v: 2, type: "authenticate", challenge: this.challenge, remember, label: deviceLabel() }),
+      authenticated,
+    ]);
   }
 
   isReady(): boolean {
@@ -456,21 +475,21 @@ class EncryptedBridge {
       }, 15_000);
       this.requests.set(id, { resolve, reject, timeout });
     });
-    await this.sendEncrypted({ v: 1, type: "http_request", id, method, path, body });
+    await this.sendEncrypted({ v: 2, type: "http_request", id, method, path, body });
     return response;
   }
 
   openTerminal(sessionId: string, callbacks: TerminalCallbacks): EncryptedTerminalLink {
     const link = new EncryptedTerminalLink(crypto.randomUUID(), this, callbacks);
     this.terminals.set(link.id, link);
-    void this.sendEncrypted({ v: 1, type: "terminal_open", id: link.id, sessionId }).catch(() => link.fail());
+    void this.sendEncrypted({ v: 2, type: "terminal_open", id: link.id, sessionId }).catch(() => link.fail());
     return link;
   }
 
   openDesktop(): EncryptedDesktopLink {
     const link = new EncryptedDesktopLink(crypto.randomUUID(), this);
     this.desktops.set(link.id, link);
-    void this.sendEncrypted({ v: 1, type: "desktop_open", id: link.id }).catch(() => link.fail());
+    void this.sendEncrypted({ v: 2, type: "desktop_open", id: link.id }).catch(() => link.fail());
     return link;
   }
 
@@ -483,25 +502,25 @@ class EncryptedBridge {
       }, 15_000);
       this.windowLists.set(id, { resolve, reject, timeout });
     });
-    await this.sendEncrypted({ v: 1, type: "window_sources_request", id });
+    await this.sendEncrypted({ v: 2, type: "window_sources_request", id });
     return response;
   }
 
   openWindow(windowId: number, maxWidth: number, maxHeight: number, callbacks: WindowCallbacks): EncryptedWindowLink {
     const link = new EncryptedWindowLink(crypto.randomUUID(), this, callbacks);
     this.windows.set(link.id, link);
-    void this.sendEncrypted({ v: 1, type: "window_open", id: link.id, windowId, maxWidth, maxHeight }).catch(() => link.fail());
+    void this.sendEncrypted({ v: 2, type: "window_open", id: link.id, windowId, maxWidth, maxHeight }).catch(() => link.fail());
     return link;
   }
 
   async sendWindowInput(id: string, value: Record<string, unknown>): Promise<void> {
-    await this.sendEncrypted({ v: 1, type: "window_input", id, ...value });
+    await this.sendEncrypted({ v: 2, type: "window_input", id, ...value });
   }
 
   async closeWindow(id: string): Promise<void> {
     this.windows.delete(id);
     if (this.socket?.readyState === WebSocket.OPEN) {
-      await this.sendEncrypted({ v: 1, type: "window_close", id, code: 1000, reason: "Viewer closed" });
+      await this.sendEncrypted({ v: 2, type: "window_close", id, code: 1000, reason: "Viewer closed" });
     }
   }
 
@@ -510,31 +529,31 @@ class EncryptedBridge {
     const bytes = data instanceof ArrayBuffer
       ? new Uint8Array(data)
       : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    await this.sendEncrypted({ v: 1, type: "desktop_data", id, data: bytesToBase64URL(bytes) });
+    await this.sendEncrypted({ v: 2, type: "desktop_data", id, data: bytesToBase64URL(bytes) });
   }
 
   async closeDesktop(id: string): Promise<void> {
     this.desktops.delete(id);
     if (this.socket?.readyState === WebSocket.OPEN) {
-      await this.sendEncrypted({ v: 1, type: "desktop_close", id, code: 1000, reason: "Viewer closed" });
+      await this.sendEncrypted({ v: 2, type: "desktop_close", id, code: 1000, reason: "Viewer closed" });
     }
   }
 
   async sendTerminalData(id: string, data: string | ArrayBuffer | ArrayBufferView): Promise<void> {
     if (typeof data === "string") {
-      await this.sendEncrypted({ v: 1, type: "terminal_data", id, binary: false, data });
+      await this.sendEncrypted({ v: 2, type: "terminal_data", id, binary: false, data });
       return;
     }
     const bytes = data instanceof ArrayBuffer
       ? new Uint8Array(data)
       : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    await this.sendEncrypted({ v: 1, type: "terminal_data", id, binary: true, data: bytesToBase64URL(bytes) });
+    await this.sendEncrypted({ v: 2, type: "terminal_data", id, binary: true, data: bytesToBase64URL(bytes) });
   }
 
   async closeTerminal(id: string): Promise<void> {
     this.terminals.delete(id);
     if (this.socket?.readyState === WebSocket.OPEN) {
-      await this.sendEncrypted({ v: 1, type: "terminal_close", id, code: 1000, reason: "Viewer closed" });
+      await this.sendEncrypted({ v: 2, type: "terminal_close", id, code: 1000, reason: "Viewer closed" });
     }
   }
 
@@ -546,21 +565,21 @@ class EncryptedBridge {
     if (file.size > 100 * 1024 * 1024) throw new Error("Files must be 100 MiB or smaller");
     const id = crypto.randomUUID();
     try {
-      await this.uploadExchange(id, "file_upload_ready", { v: 1, type: "file_upload_start", id, name: file.name, size: file.size });
+      await this.uploadExchange(id, "file_upload_ready", { v: 2, type: "file_upload_start", id, name: file.name, size: file.size });
       const chunkSize = 192 * 1024;
       for (let offset = 0; offset < file.size; offset += chunkSize) {
         const bytes = new Uint8Array(await file.slice(offset, Math.min(file.size, offset + chunkSize)).arrayBuffer());
         const reply = await this.uploadExchange(id, "file_upload_progress", {
-          v: 1, type: "file_upload_chunk", id, offset, data: bytesToBase64URL(bytes),
+          v: 2, type: "file_upload_chunk", id, offset, data: bytesToBase64URL(bytes),
         });
         onProgress(reply.received, reply.total);
       }
-      const complete = await this.uploadExchange(id, "file_upload_complete", { v: 1, type: "file_upload_finish", id });
+      const complete = await this.uploadExchange(id, "file_upload_complete", { v: 2, type: "file_upload_finish", id });
       onProgress(file.size, file.size);
       return complete.path || file.name;
     } catch (error) {
       if (this.socket?.readyState === WebSocket.OPEN) {
-        void this.sendEncrypted({ v: 1, type: "file_upload_cancel", id }).catch(() => undefined);
+        void this.sendEncrypted({ v: 2, type: "file_upload_cancel", id }).catch(() => undefined);
       }
       throw error;
     }
@@ -574,9 +593,13 @@ class EncryptedBridge {
 
   private async receive(packet: string): Promise<void> {
     const value = await this.decrypt(packet);
-    if (!isRecord(value) || value.v !== 1 || typeof value.type !== "string") throw new Error("Invalid encrypted message");
+    if (!isRecord(value) || value.v !== 2 || typeof value.type !== "string") throw new Error("Invalid encrypted message");
     if (value.type === "authenticated") {
       if (value.challenge !== this.challenge) throw new Error("Encrypted login challenge did not match");
+      if (!this.deviceID) {
+        if (typeof value.deviceId !== "string" || typeof value.secret !== "string") throw new Error("Your computer needs the device-authentication update");
+        this.issuedCredential = { id: value.deviceId, secret: value.secret };
+      } else if (value.deviceId !== this.deviceID) throw new Error("Device identity did not match");
       this.authResolve?.();
       this.authResolve = undefined;
       this.authReject = undefined;
@@ -695,7 +718,8 @@ class EncryptedBridge {
       if (!this.key || !this.channel || this.socket?.readyState !== WebSocket.OPEN) throw new Error("Encrypted portal is disconnected");
       const sequence = this.sendSequence;
       this.sendSequence += 1;
-      this.socket.send(await encryptPacket(this.key, this.channel, "browser", sequence, value));
+      const packet = await encryptPacket(this.key, this.channel, "browser", sequence, value);
+      this.socket.send(bytesToBase64URL(new TextEncoder().encode(JSON.stringify({ v: 2, deviceId: this.deviceID, packet }))));
     });
     return this.sendChain;
   }
@@ -760,7 +784,9 @@ class EncryptedBridge {
     if (encryptedBridge === this && state.authenticated) {
       encryptedBridge = undefined;
       state.authenticated = false;
-      if (portalResumeKey) {
+      if (error.message.includes("Invalid portal token")) {
+        void clearLocalLogin("Device access was revoked. Enter the current portal token.");
+      } else if (portalResumeKey) {
         setConnectionState("Connection paused · reconnecting…", "connecting");
         window.queueMicrotask(() => { void resumeEncryptedPortal(); });
       } else {
@@ -783,7 +809,9 @@ async function waitForBridge(socket: WebSocket): Promise<{ id: string }> {
       if (typeof event.data !== "string") return;
       try {
         const value: unknown = JSON.parse(event.data);
-        if (!isRecord(value) || value.type !== "bridge_ready" || value.protocol !== "e2e-v1" || typeof value.id !== "string") return;
+        if (!isRecord(value) || value.type !== "bridge_ready") return;
+        if (value.protocol !== "e2e-v2") { cleanup(); reject(new Error("Update the portal, relay and computer together to use device login")); return; }
+        if (typeof value.id !== "string") return;
         cleanup();
         resolve({ id: value.id });
       } catch { /* Wait for a valid bridge greeting. */ }
@@ -890,6 +918,7 @@ function openPortalKeyDatabase(): Promise<IDBDatabase> {
 }
 
 async function loadPortalResumeKey(): Promise<CryptoKey | undefined> {
+  const generation = authGeneration.current();
   if (!("indexedDB" in window)) return undefined;
   let database: IDBDatabase | undefined;
   try {
@@ -899,9 +928,12 @@ async function loadPortalResumeKey(): Promise<CryptoKey | undefined> {
       request.addEventListener("success", () => resolve(request.result), { once: true });
       request.addEventListener("error", () => reject(request.error || new Error("Could not read secure device storage")), { once: true });
     });
-    if (!(value instanceof CryptoKey) || value.extractable || value.algorithm.name !== "AES-GCM") return undefined;
-    if (!value.usages.includes("encrypt") || !value.usages.includes("decrypt")) return undefined;
-    return value;
+    if (!isRecord(value) || value.v !== 2 || typeof value.id !== "string" || !(value.key instanceof CryptoKey)) return undefined;
+    const key = value.key;
+    if (key.extractable || key.algorithm.name !== "AES-GCM" || !key.usages.includes("encrypt") || !key.usages.includes("decrypt")) return undefined;
+    if (!authGeneration.owns(generation)) return undefined;
+    portalDeviceID = value.id;
+    return key;
   } catch {
     return undefined;
   } finally {
@@ -910,13 +942,17 @@ async function loadPortalResumeKey(): Promise<CryptoKey | undefined> {
 }
 
 async function savePortalResumeKey(key: CryptoKey): Promise<boolean> {
+  const generation = authGeneration.current();
+  const id = portalDeviceID;
   if (!("indexedDB" in window) || key.extractable) return false;
   let database: IDBDatabase | undefined;
   try {
     database = await openPortalKeyDatabase();
     await new Promise<void>((resolve, reject) => {
       const transaction = database!.transaction(PORTAL_KEY_STORE, "readwrite");
-      transaction.objectStore(PORTAL_KEY_STORE).put(key, PORTAL_KEY_ID);
+      if (!authGeneration.owns(generation)) { transaction.abort(); reject(new Error("Login cancelled")); return; }
+      transaction.objectStore(PORTAL_KEY_STORE).delete("portal-e2e-key");
+      transaction.objectStore(PORTAL_KEY_STORE).put({ v: 2, id, key }, PORTAL_KEY_ID);
       transaction.addEventListener("complete", () => resolve(), { once: true });
       transaction.addEventListener("abort", () => reject(transaction.error || new Error("Could not save secure login")), { once: true });
       transaction.addEventListener("error", () => reject(transaction.error || new Error("Could not save secure login")), { once: true });
@@ -929,17 +965,20 @@ async function savePortalResumeKey(key: CryptoKey): Promise<boolean> {
   }
 }
 
-async function clearPortalResumeKey(): Promise<void> {
-  portalResumeKey = undefined;
+async function clearPortalResumeKey(forgetMemory = true): Promise<void> {
+  const generation = authGeneration.current();
+  if (forgetMemory) { portalResumeKey = undefined; portalDeviceID = ""; }
   if (portalReconnectTimer) window.clearTimeout(portalReconnectTimer);
   portalReconnectTimer = 0;
   if (!("indexedDB" in window)) return;
   let database: IDBDatabase | undefined;
   try {
     database = await openPortalKeyDatabase();
+    if (!authGeneration.owns(generation)) return;
     await new Promise<void>((resolve, reject) => {
       const transaction = database!.transaction(PORTAL_KEY_STORE, "readwrite");
       transaction.objectStore(PORTAL_KEY_STORE).delete(PORTAL_KEY_ID);
+      transaction.objectStore(PORTAL_KEY_STORE).delete("portal-e2e-key");
       transaction.addEventListener("complete", () => resolve(), { once: true });
       transaction.addEventListener("abort", () => reject(transaction.error), { once: true });
     });
@@ -1020,19 +1059,15 @@ function markAppNavigationActive(destination: AppDestination): void {
 }
 
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const generation = authGeneration.current();
   if (encryptedPortal) {
     if (!encryptedBridge) throw new Error("Encrypted portal is not connected");
     const method = init.method ?? "GET";
     const body = typeof init.body === "string" ? init.body : "";
     const response = await encryptedBridge.request(method, path, body);
+    authGeneration.assert(generation);
     if (response.status === 401) {
-      state.authenticated = false;
-      await clearPortalResumeKey();
-      closeConnection();
-      const bridge = encryptedBridge;
-      encryptedBridge = undefined;
-      bridge?.close();
-      renderLogin();
+      await clearLocalLogin("Your portal session expired. Sign in again.");
       throw new Error("Your portal session expired");
     }
     if (response.status < 200 || response.status >= 300) {
@@ -1060,18 +1095,19 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers: { "Content-Type": "application/json", ...init.headers },
   });
+  authGeneration.assert(generation);
   if (response.status === 401) {
-    state.authenticated = false;
-    closeConnection();
-    renderLogin();
-    throw new Error("Your portal session expired");
+    if (path !== "/api/login") await clearLocalLogin("Your portal session expired. Sign in again.");
+    throw new Error(path === "/api/login" ? "Invalid portal token" : "Your portal session expired");
   }
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as { error?: string };
     throw new Error(body.error || `Request failed (${response.status})`);
   }
   if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  const result = await response.json() as T;
+  authGeneration.assert(generation);
+  return result;
 }
 
 function isWorkflowAPIPath(path: string): boolean {
@@ -1099,19 +1135,25 @@ async function resumeEncryptedPortal(): Promise<void> {
     return;
   }
   const key = portalResumeKey;
+  const deviceID = portalDeviceID;
+  const generation = authGeneration.current();
   const selectedSession = state.selected;
   if (portalReconnectTimer) window.clearTimeout(portalReconnectTimer);
   portalReconnectTimer = 0;
   setConnectionState("Reconnecting securely…", "connecting");
-  portalReconnect = (async () => {
+  const reconnect = (async () => {
     const previous = encryptedBridge;
     encryptedBridge = undefined;
     previous?.close();
     const bridge = new EncryptedBridge();
-    await bridge.connectWithKey(key);
+    pendingAuthBridges.add(bridge);
+    try { await bridge.connectWithKey(key, deviceID); authGeneration.assert(generation); }
+    catch (error) { bridge.close(); throw error; }
+    finally { pendingAuthBridges.delete(bridge); }
     encryptedBridge = bridge;
     state.authenticated = true;
     await loadSessions();
+    authGeneration.assert(generation);
     const session = selectedSession ? state.sessions.find((item) => item.id === selectedSession) : undefined;
     if (state.view === "workflow" && state.selectedWorkflow) await renderWorkflowDetail(state.selectedWorkflow);
     else if (state.view === "workflows") await renderWorkflows();
@@ -1126,12 +1168,12 @@ async function resumeEncryptedPortal(): Promise<void> {
     }
     else renderSessions();
   })().catch(async (caught: unknown) => {
+    if (!authGeneration.owns(generation)) return;
     encryptedBridge = undefined;
     state.authenticated = false;
     const message = caught instanceof Error ? caught.message : "Could not reconnect securely";
     if (message.includes("Invalid portal token")) {
-      await clearPortalResumeKey();
-      renderLogin("The saved device login is no longer valid. Enter the current portal token.");
+      await clearLocalLogin("The saved device login is no longer valid. Enter the current portal token.");
       return;
     }
     // iOS briefly suspends network sockets while Photos/the file picker is on
@@ -1155,25 +1197,34 @@ async function resumeEncryptedPortal(): Promise<void> {
       }, 2500);
     }
   }).finally(() => {
-    portalReconnect = undefined;
+    if (portalReconnect === reconnect) portalReconnect = undefined;
   });
-  await portalReconnect;
+  portalReconnect = reconnect;
+  await reconnect;
 }
 
 async function boot(): Promise<void> {
+  const generation = authGeneration.current();
   encryptedPortal = !(await isDirectPortal());
+  if (!authGeneration.owns(generation)) return;
+  if (startupQR || startupQRError) { renderLogin(startupQRError); const qr = startupQR; startupQR = undefined; if (qr) handleScannedLogin(qr); return; }
+  if (wasLoggedOut()) { renderLogin(); return; }
   if (encryptedPortal) {
-    portalResumeKey = await loadPortalResumeKey();
+    const storedKey = await loadPortalResumeKey();
+    if (!authGeneration.owns(generation)) return;
+    portalResumeKey = storedKey;
     if (portalResumeKey) {
       renderLogin("Restoring the secure device login…");
       await resumeEncryptedPortal();
     } else {
-      renderLogin();
+      await clearPortalResumeKey();
+      if (authGeneration.owns(generation)) renderLogin();
     }
     return;
   }
   try {
     await api<{ authenticated: boolean }>("/api/me");
+    authGeneration.assert(generation);
     state.authenticated = true;
     await loadSessions();
     await renderRememberedView();
@@ -1226,6 +1277,181 @@ function rememberPortalView(view: PortalView, selected = state.selected, selecte
   try { localStorage.setItem("termlinks-last-view-v1", JSON.stringify({ view, selected, selectedWorkflow })); }
   catch { /* Private browsing may reject presentation-state storage. */ }
 }
+
+function deviceLabel(): string {
+  const ua = navigator.userAgent;
+  const platform = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? "iPad" : /Android/.test(ua) ? "Android" : /Macintosh/.test(ua) ? "Mac" : /Windows/.test(ua) ? "Windows" : "Linux";
+  const browser = /Firefox|FxiOS/.test(ua) ? "Firefox" : /Edg/.test(ua) ? "Edge" : /Chrome|CriOS/.test(ua) ? "Chrome" : /Safari/.test(ua) ? "Safari" : "Browser";
+  return `${platform} · ${browser}${window.matchMedia("(display-mode: standalone)").matches ? " app" : ""}`;
+}
+
+function beginManualPortalLogin(): number {
+  const generation = authGeneration.invalidate();
+  if (portalReconnectTimer) window.clearTimeout(portalReconnectTimer);
+  portalReconnectTimer = 0;
+  portalReconnect = undefined;
+  // Do not start another restoration while the user enters fresh credentials.
+  portalResumeKey = undefined;
+  portalDeviceID = "";
+  for (const pending of pendingAuthBridges) pending.close();
+  pendingAuthBridges.clear();
+  return generation;
+}
+
+async function loginPortal(token: string, remember: boolean): Promise<void> {
+  const generation = authGeneration.current();
+  loginAbort?.abort(); loginAbort = new AbortController();
+  if (!encryptedPortal) {
+    await api("/api/login", { method: "POST", signal: loginAbort.signal, body: JSON.stringify({ token, remember, label: deviceLabel() }) });
+    authGeneration.assert(generation);
+    try { localStorage.removeItem(LOGGED_OUT_KEY); } catch { /* Storage may be unavailable. */ }
+    return;
+  }
+  const previous = encryptedBridge; encryptedBridge = undefined; previous?.close();
+  const bootstrap = new EncryptedBridge(); pendingAuthBridges.add(bootstrap);
+  let credential: { id: string; secret: string };
+  try {
+    const masterKey = await deriveEncryptionKey(token); authGeneration.assert(generation);
+    await bootstrap.connectWithKey(masterKey, "", remember); authGeneration.assert(generation);
+    if (!bootstrap.issuedCredential) throw new Error("Computer did not issue a device login");
+    credential = bootstrap.issuedCredential;
+  } finally { pendingAuthBridges.delete(bootstrap); bootstrap.close(); }
+  const key = await deriveEncryptionKey(credential.secret); authGeneration.assert(generation);
+  const bridge = new EncryptedBridge(); pendingAuthBridges.add(bridge);
+  try { await bridge.connectWithKey(key, credential.id); authGeneration.assert(generation); }
+  catch (error) { bridge.close(); throw error; }
+  finally { pendingAuthBridges.delete(bridge); }
+  encryptedBridge = bridge; portalResumeKey = key; portalDeviceID = credential.id;
+  if (remember) {
+    const saved = await savePortalResumeKey(key); authGeneration.assert(generation);
+    if (!saved) window.alert("Connected, but this browser could not save your login. You may need the token again after closing the app.");
+  } else { await clearPortalResumeKey(false); authGeneration.assert(generation); }
+  try { localStorage.removeItem(LOGGED_OUT_KEY); } catch { /* Storage may be unavailable. */ }
+}
+
+async function clearLocalLogin(message = "", broadcast = false): Promise<void> {
+  const generation = authGeneration.invalidate();
+  try { localStorage.setItem(LOGGED_OUT_KEY, "true"); } catch { /* In-memory logout still applies. */ }
+  loginAbort?.abort(); loginAbort = undefined;
+  state.authenticated = false; stopPolling();
+  portalReconnect = undefined;
+  const previous = encryptedBridge; encryptedBridge = undefined;
+  for (const pending of pendingAuthBridges) pending.close(); pendingAuthBridges.clear();
+  previous?.close(); closeConnection();
+  for (const dialog of document.querySelectorAll<HTMLDialogElement>(".profile-dialog")) { dialog.close(); dialog.remove(); }
+  if (broadcast) authBroadcast?.postMessage({ type: "logout" });
+  const clearing = clearPortalResumeKey();
+  if (authGeneration.owns(generation)) renderLogin(message);
+  await clearing;
+}
+
+async function logoutPortal(): Promise<void> {
+  const bridge = encryptedBridge; encryptedBridge = undefined;
+  const wasEncrypted = encryptedPortal;
+  const request = wasEncrypted
+    ? bridge?.request("POST", "/api/logout", "")
+    : fetch("/api/logout", { method: "POST", headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(2500) });
+  const settled = request?.then((response) => ({ response, error: undefined as unknown }), (error: unknown) => ({ response: undefined, error }));
+  const clearing = clearLocalLogin("Signing out…", true);
+  const generation = authGeneration.current();
+  await clearing;
+  let confirmed = false;
+  let timeout = 0;
+  try {
+    if (settled) {
+      const result = await Promise.race([settled, new Promise<never>((_, reject) => { timeout = window.setTimeout(() => reject(new Error("offline")), 2500); })]);
+      if (result.error) throw result.error;
+      confirmed = !!result.response && result.response.status >= 200 && result.response.status < 300;
+    }
+  } catch (error) {
+    // The connector closes the revoked device's channel before the HTTP reply.
+    confirmed = error instanceof Error && error.message.includes("Invalid portal token");
+  } finally {
+    window.clearTimeout(timeout); bridge?.close();
+    if (authGeneration.owns(generation)) renderLogin(confirmed ? "Signed out." : "Signed out on this device. The computer could not confirm revocation; remove this device from another signed-in device if needed.");
+  }
+}
+
+window.addEventListener("storage", (event) => {
+  if (event.key === LOGGED_OUT_KEY && event.newValue === "true") void clearLocalLogin("Signed out in another tab.");
+});
+
+authBroadcast?.addEventListener("message", (event: MessageEvent<unknown>) => {
+  if (isRecord(event.data) && event.data.type === "logout") void clearLocalLogin("Signed out in another tab.");
+});
+
+function handleScannedLogin(value: QRLogin): void {
+  if (value.url) {
+    const target = new URL(value.url);
+    if (target.origin !== location.origin || target.pathname !== location.pathname) {
+      const dialog = el("dialog", "profile-dialog");
+      dialog.setAttribute("aria-label", "Open another portal");
+      const title = el("h2", undefined, "Open another portal?");
+      const destination = el("p", undefined, target.origin + target.pathname);
+      const open = el("button", "primary-button", "Open portal");
+      open.addEventListener("click", () => { location.assign(target.href); });
+      const cancel = el("button", "ghost-button", "Cancel"); cancel.addEventListener("click", () => dialog.remove());
+      dialog.addEventListener("close", () => dialog.remove()); dialog.append(title, destination, open, cancel); document.body.append(dialog); dialog.showModal(); return;
+    }
+  }
+  const input = document.querySelector<HTMLInputElement>("#token");
+  const form = document.querySelector<HTMLFormElement>(".login-form");
+  if (input && form) { input.value = value.token; form.requestSubmit(); }
+}
+
+type ConnectedDevice = { id: string; label: string; createdAt: string; lastSeen: string; online: boolean; current: boolean };
+
+function createProfileMenu(): HTMLButtonElement {
+  const button = el("button", "ghost-button profile-button", "Profile");
+  button.type = "button"; button.setAttribute("aria-haspopup", "dialog");
+  button.addEventListener("click", () => {
+    const dialog = el("dialog", "profile-dialog");
+      dialog.setAttribute("aria-label", "Profile");
+    const title = el("h2", undefined, "Profile");
+    const content = el("div", "profile-content");
+    const devices = el("button", "profile-action", "Connected devices");
+    const logout = el("button", "profile-action danger", "Log out");
+    const close = el("button", "ghost-button", "Close");
+    let refresh = 0;
+    const cleanup = (): void => { window.clearInterval(refresh); dialog.remove(); };
+    close.addEventListener("click", () => { dialog.close(); cleanup(); });
+    dialog.addEventListener("close", cleanup);
+    logout.addEventListener("click", () => { cleanup(); void logoutPortal(); });
+    const showDevices = async (): Promise<void> => {
+      title.textContent = "Connected devices";
+      dialog.setAttribute("aria-label", "Connected devices");
+      try {
+        const response = await api<{ devices: ConnectedDevice[] }>("/api/devices");
+        if (!dialog.isConnected || !state.authenticated) return;
+        const list = el("div", "device-list");
+        for (const device of response.devices) {
+          const row = el("section", "device-row");
+          const details = el("div", "device-details");
+          details.append(el("strong", undefined, device.label + (device.current ? " · This device" : "")), el("p", undefined, `${device.online ? "Online" : "Offline"} · Last active ${new Date(device.lastSeen).toLocaleString()}`), el("small", undefined, `Added ${new Date(device.createdAt).toLocaleDateString()}`));
+          const remove = el("button", "ghost-button danger", "Remove");
+          remove.addEventListener("click", async () => {
+            if (!window.confirm(`Remove ${device.label}? Its saved access will stop immediately. The current shared token can still be used to sign in again.`)) return;
+            remove.disabled = true;
+            try {
+              if (device.current) { await logoutPortal(); return; }
+              await api(`/api/devices/${encodeURIComponent(device.id)}`, { method: "DELETE" }); await showDevices();
+            } catch (error) { remove.disabled = false; window.alert(error instanceof Error ? error.message : "Could not remove device"); }
+          });
+          row.append(details, remove); list.append(row);
+        }
+        content.replaceChildren(el("p", "device-explanation", "Each entry is a browser or installed app. Rotate your portal token if someone else knows it."), list);
+      } catch (error) { if (dialog.isConnected) content.replaceChildren(el("p", "form-error", error instanceof Error ? error.message : "Could not load devices")); }
+    };
+    devices.addEventListener("click", () => { void showDevices(); if (!refresh) refresh = window.setInterval(() => { void showDevices(); }, 15000); });
+    content.append(devices, logout); dialog.append(title, content, close); document.body.append(dialog); dialog.showModal();
+  });
+  return button;
+}
+
+window.setInterval(() => {
+  if (state.authenticated && !document.hidden) void api("/api/devices/heartbeat", { method: "POST" }).catch(() => undefined);
+}, 15000);
+
 
 function renderLogin(message = ""): void {
   stopPolling();
@@ -1280,32 +1506,26 @@ function renderLogin(message = ""): void {
     submit.disabled = true;
     submit.textContent = "Checking…";
     error.textContent = "";
+    const generation = beginManualPortalLogin();
     try {
       const token = input.value.trim();
       if (token.length < 32) throw new Error("Paste the complete portal token without backticks");
-      if (encryptedPortal) {
-        encryptedBridge?.close();
-        const key = await deriveEncryptionKey(token);
-        const bridge = new EncryptedBridge();
-        await bridge.connectWithKey(key);
-        encryptedBridge = bridge;
-        portalResumeKey = key;
-        if (remember.checked) await savePortalResumeKey(key);
-        else await clearPortalResumeKey();
-      } else {
-        await api("/api/login", { method: "POST", body: JSON.stringify({ token }) });
-      }
+      await loginPortal(token, remember.checked);
       state.authenticated = true;
       await loadSessions();
+      authGeneration.assert(generation);
       await renderRememberedView();
     } catch (caught) {
+      if (!authGeneration.owns(generation)) return;
       error.textContent = caught instanceof Error ? caught.message : "Login failed";
       submit.disabled = false;
       submit.textContent = "Unlock portal";
       input.focus();
     }
   });
-  panel.append(form, createInstallButton(), el("p", "login-hint", "On your computer: termlinks token · A remembered device reconnects automatically after iOS suspension"));
+  const scan = el("button", "ghost-button qr-scan-button", "Scan QR");
+  scan.type = "button"; scan.addEventListener("click", () => openQRScanner(handleScannedLogin));
+  panel.append(form, scan, createInstallButton(), el("p", "login-hint", "On your computer: termlinks token · A remembered device reconnects automatically after iOS suspension"));
   page.append(panel);
   app.append(page);
   if (!window.matchMedia("(pointer: coarse)").matches) input.focus();
@@ -1333,20 +1553,7 @@ function renderSessions(): void {
   const status = el("div", "computer-status");
   status.id = "computer-status";
   status.append(el("span", "online-dot"), el("span", "computer-status-label", encryptedPortal ? "E2E · Computer online" : "Computer online"));
-  const logout = el("button", "ghost-button", "Log out");
-  logout.type = "button";
-  logout.addEventListener("click", async () => {
-    try {
-      await api("/api/logout", { method: "POST" });
-    } finally {
-      state.authenticated = false;
-      await clearPortalResumeKey();
-      encryptedBridge?.close();
-      encryptedBridge = undefined;
-      renderLogin();
-    }
-  });
-  header.append(brand, status, createInstallButton(), logout);
+  header.append(brand, status, createInstallButton(), createProfileMenu());
 
   const heading = el("div", "dashboard-heading");
   const titleGroup = el("div");
@@ -1422,6 +1629,7 @@ async function renderWorkflows(message = ""): Promise<void> {
   back.type = "button";
   back.addEventListener("click", renderSessions);
   header.append(back, brand, el("span", "workflow-private-badge", encryptedPortal ? "E2E · LOCAL STATE" : "LOCAL STATE"));
+  header.append(createProfileMenu());
 
   const heading = el("div", "workflow-heading");
   heading.append(
@@ -1646,6 +1854,7 @@ async function renderWorkflowDetail(id: string): Promise<void> {
   roomIdentity.append(el("strong", "team-room-title", "Team room"), el("span", "team-room-subtitle", "Loading local conversation…"));
   const roomState = el("span", "workflow-status queued", "CONNECTING");
   header.append(back, roomIdentity, roomState);
+  header.append(createProfileMenu());
   const participants = el("section", "team-participants");
   participants.setAttribute("aria-label", "Agent teammates");
   const feed = el("section", "team-message-feed");
@@ -2017,6 +2226,7 @@ function renderDesktop(): void {
     }
   });
   header.append(back, identity, fullscreen);
+  header.append(createProfileMenu());
 
   const connection = el("div", "connection-bar");
   connection.id = "connection-state";
@@ -3065,6 +3275,7 @@ function renderTerminal(id: string, workflowID?: string): void {
   const headerActions = el("div", "terminal-header-actions");
   headerActions.append(inputModeButton, menu);
   header.append(back, identity, headerActions);
+  header.append(createProfileMenu());
 
   const actions = el("div", "actions-menu");
   const reconnect = el("button", "menu-button", "Reconnect");

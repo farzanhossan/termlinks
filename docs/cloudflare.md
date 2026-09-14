@@ -10,7 +10,7 @@ phone browser → Cloudflare Pages Function → Worker/Durable Object ← outbou
 
 The browser talks only to the owner's Pages hostname. Its Pages Function forwards `/ws/bridge` to the configured relay Worker, while a Durable Object carries opaque ciphertext between that browser and one computer. No inbound router port, custom domain, or DNS record is required.
 
-The browser and local connector independently derive an AES-256-GCM key from the random portal token. API requests, session metadata, terminal output, keystrokes, window frames, and control input remain application-encrypted across Pages, the Worker, and the Durable Object. Cloudflare can observe ordinary connection metadata such as IP addresses, timing, and packet sizes, but it cannot decrypt those payloads. The portal token never crosses the network and is not stored by the browser.
+The browser and local connector derive a bootstrap AES-256-GCM key from the random portal token to register a device, then use a separately issued device key for application access. API requests, session metadata, terminal output, keystrokes, window frames, and control input remain application-encrypted across Pages, the Worker, and the Durable Object. Cloudflare can observe ordinary connection metadata such as IP addresses, timing, and packet sizes, but it cannot decrypt those payloads. The portal token never crosses the network and is not stored by the browser.
 
 As with any hosted web E2E application, the JavaScript is delivered by the hosting provider. A compromised Cloudflare account or modified deployment could serve code that captures a token as it is entered. Protect the account with MFA and review deployments; application-layer encryption protects relay data, not a malicious frontend build.
 
@@ -189,3 +189,13 @@ npm run test:e2e:web
 The local daemon is provider-independent. Any reverse tunnel or HTTPS proxy that preserves WebSocket upgrades can expose `http://127.0.0.1:57321` (or the listener selected with `termlinks -p PORT`) directly for terminal access. In that mode, use the provider's authentication/MFA layer as defense in depth and understand that TLS normally terminates at that provider.
 
 To retain Termlinks' application-layer E2E bridge and remote-desktop/window protocol on a different host, implement the small channel relay described in [architecture.md](architecture.md): one authenticated outbound connector, browser channels, opaque bounded ciphertext forwarding, and channel-close notifications. The existing Cloudflare Worker is the reference adapter.
+
+## Upgrade for device access and QR login
+
+This change introduces encrypted protocol `e2e-v2`. Build the web assets and backend together, update the Worker relay and Pages portal, and restart the upgraded connector. Activate the upgraded daemon after existing managed terminals have finished: a daemon restart still ends its PTYs. Do not mix a v1 daemon/connector with the v2 portal; incompatible connections require an update rather than a legacy login fallback. Once upgraded, token rotation itself never restarts the daemon.
+
+Existing shared portal tokens remain valid. Users enter their token once after upgrade to register a device; old remembered master keys are discarded. Remembered logins then use independent, revocable device keys. Browser labels, credentials and activity stay on the computer; the relay sees opaque credential selectors, channels and ciphertext.
+
+Run `termlinks token --url https://<your-pages-or-custom-domain>` once to save your phone-accessible portal URL for QR codes. Use the Pages/custom portal URL, not `RELAY_ORIGIN` or the connector secret. **Scan QR** uses the camera only after user interaction and can also read an image. Hosting response headers permit `camera=(self)`; HTTPS is required for ordinary phone-camera access.
+
+Use **Profile → Connected devices** to revoke a browser, **Profile → Log out** to revoke the current device, and `termlinks token --rotate` if the shared token has leaked. None of these operations stops managed PTY processes.

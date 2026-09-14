@@ -7,12 +7,13 @@
     "dev": "node scripts/build.mjs --serve",
     "build": "tsc --noEmit && node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/test-terminal-history.mjs"
+    "test": "node scripts/test-terminal-history.mjs && node scripts/test-portal-auth.mjs"
   },
   "dependencies": {
     "@novnc/novnc": "1.7.0",
     "@xterm/addon-fit": "0.11.0",
-    "@xterm/xterm": "6.0.0"
+    "@xterm/xterm": "6.0.0",
+    "jsqr": "1.4.0"
   },
   "devDependencies": {
     "@types/node": "22.10.2",

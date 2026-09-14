@@ -64,7 +64,7 @@ The same app is installable as a PWA from the HTTPS Pages deployment or a truste
 
 ### Hosted bridge
 
-The reference public path consists of Cloudflare Pages, a Pages Function, a Worker with one Durable Object, and an outbound connector inside the same Go executable. Cloudflare is the included default adapter, not a daemon dependency. The browser and connector derive the same AES-256-GCM key from the 256-bit portal token. The Worker routes ciphertext by a random channel ID but never receives the key or plaintext.
+The reference public path consists of Cloudflare Pages, a Pages Function, a Worker with one Durable Object, and an outbound connector inside the same Go executable. Cloudflare is the included default adapter, not a daemon dependency. The browser and connector use a shared-token bootstrap key to register, then switch to an independent device AES-256-GCM key for application access. The Worker routes ciphertext by a random channel ID but never receives the key or plaintext.
 
 The same static client auto-detects a directly served daemon through the public, data-free `/api/mode` endpoint. That lets SSH, private-VPN, and generic HTTPS reverse tunnels use the cookie-authenticated direct API without hostname-specific builds. Another provider can also replace Cloudflare while retaining application-layer encryption by implementing the channel relay described below.
 
@@ -127,13 +127,14 @@ Phone browser                 Cloudflare                    Local computer
      │── AES-GCM(auth challenge) ─┼── opaque ciphertext ─────────►│ decrypt + local login
      │◄─ AES-GCM(auth proof) ─────┼── opaque ciphertext ──────────│
      │                            │                               │
+     │ reconnect using issued device key (new channel)            │
      │── encrypted create/list/input ────────────────────────────►│ approved request / Unix socket / PTY write
      │◄─ encrypted metadata/output┼───────────────────────────────│
 ```
 
 The AES-GCM additional authenticated data includes the random relay channel ID, sender direction, and monotonic sequence number, preventing ciphertext from being moved between connections, reflected, reordered, or replayed. Every packet also uses a new 96-bit random nonce. Cloudflare can see endpoints, IP addresses, timing, packet sizes, channel IDs, and online state, but not the portal token, cookies, commands, session metadata, terminal output, or keystrokes.
 
-The public flow asks for the portal token after each page load and retains only a non-extractable Web Crypto key in page memory. The connector performs the actual local cookie login using its local token file. A wrong token cannot decrypt the connector's challenge response.
+The public flow exchanges the shared token for a device credential once. Remembered devices store a non-exportable device CryptoKey in IndexedDB; temporary devices keep it in page memory. The connector obtains device-bound HTTP sessions from the daemon over its private socket. A wrong token or revoked device key cannot complete the encrypted challenge.
 
 ## Encrypted browser-to-computer file flow
 
@@ -191,3 +192,15 @@ Frames are scaled to a bounded browser-requested maximum, JPEG encoded locally, 
 - Selected-window viewer closes: its native capture object is released; macOS Screen Recording and Accessibility grants remain until revoked in System Settings.
 - `termlinks desktop disable`: the connector restarts with GUI tunneling revoked; the terminal daemon and managed PTYs remain running.
 - Daemon/computer stops: in-memory sessions end. Persistence across restart is outside this MVP.
+
+## Device authentication v2
+
+The daemon owns `devices.db`, the saved shared token, HTTP sessions and token generation checks. A successful shared-token login issues a random device ID and secret. The direct portal stores its resume credential in an HttpOnly cookie; the encrypted portal imports the derived device key as a non-exportable CryptoKey in IndexedDB. Bootstrap channels cannot execute application operations. A second connection proves the issued device key before receiving access.
+
+Browser packets contain a base64url JSON envelope `{v: 2, deviceId, packet}`. `packet` is the existing sequence/nonce/AES-GCM ciphertext layout with the v2 context. An empty device ID selects bootstrap authentication; a random device ID selects its independently generated key. The relay forwards the envelope without receiving keys. Changing the selector selects a different key, so authentication fails. Connector replies remain encrypted packets bound to the channel, direction and sequence.
+
+The connector obtains current token/device key snapshots and revocation notifications from `/v1/auth/events` over the private Unix socket, acknowledges application of each snapshot, and fails closed when the subscription ends. Private `/v1/auth/login` issues device-bound HTTP sessions after key possession has been verified; `/v1/auth/rotate` is CLI-only. The public API exposes device metadata through `GET /api/devices`, removal through `DELETE /api/devices/{id}`, and presence through `POST /api/devices/heartbeat`.
+
+Mutation is serialized. Rotation writes and syncs an atomic token replacement; device rows are bound to the token digest, preventing old credentials from reviving after interruption/restart. The daemon invalidates sessions and closes their tracked browser WebSockets. The connector closes revoked terminal, desktop, capture and upload channels before acknowledging. Local terminal attachments and PTY processes remain active. Temporary device credentials are discarded when the daemon restarts.
+
+The UI treats logout as an authentication-generation change. Pending reconnect/login completions cannot publish authenticated state or save credentials after cancellation. A local signed-out marker prevents offline HttpOnly-cookie restoration; cross-tab notifications cancel other tabs. Short-lived HTTP sessions renew from valid device credentials without retaining the shared token.

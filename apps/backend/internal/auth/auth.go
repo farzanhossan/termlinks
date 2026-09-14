@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"sync"
@@ -18,16 +19,28 @@ var (
 const SessionDuration = 12 * time.Hour
 
 type Manager struct {
-	mu       sync.Mutex
-	token    [32]byte
-	sessions map[[32]byte]time.Time
-	attempts map[string][]time.Time
-	now      func() time.Time
+	mu        sync.Mutex
+	changeMu  sync.Mutex
+	db        *sql.DB
+	rawToken  string
+	tokenPath string
+	devices   map[string]Device
+	// Ownership survives HTTP expiry solely so logout can still revoke the device.
+	// These entries never authorize access and are removed with the device.
+	owners     map[[32]byte]string
+	watchers   map[chan Event]bool
+	streams    map[uint64]stream
+	nextStream uint64
+	token      [32]byte
+	sessions   map[[32]byte]time.Time
+	attempts   map[string][]time.Time
+	now        func() time.Time
 }
 
 func New(token string) *Manager {
 	return &Manager{
 		token:    sha256.Sum256([]byte(token)),
+		rawToken: token, devices: make(map[string]Device), owners: make(map[[32]byte]string), watchers: make(map[chan Event]bool), streams: make(map[uint64]stream),
 		sessions: make(map[[32]byte]time.Time),
 		attempts: make(map[string][]time.Time),
 		now:      time.Now,
@@ -104,5 +117,11 @@ func (m *Manager) Logout(sessionID string) {
 	hash := sha256.Sum256([]byte(sessionID))
 	m.mu.Lock()
 	delete(m.sessions, hash)
+	for id, stream := range m.streams {
+		if stream.session == hash {
+			stream.close()
+			delete(m.streams, id)
+		}
+	}
 	m.mu.Unlock()
 }

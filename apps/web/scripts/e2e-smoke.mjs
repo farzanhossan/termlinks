@@ -36,29 +36,36 @@ const { deriveEncryptionKey, encryptPacket, decryptPacket, bytesToBase64URL, bas
 const websocketURL = new URL(portal);
 websocketURL.protocol = "wss:";
 websocketURL.pathname = "/ws/bridge";
-const socket = new WebSocket(websocketURL);
+let socket;
 const queued = [];
 const waiters = [];
 let terminalError;
-socket.addEventListener("message", (event) => {
-  const waiter = waiters.shift();
-  if (waiter) waiter.resolve(event.data);
-  else queued.push(event.data);
-});
-socket.addEventListener("close", (event) => {
-  terminalError = new Error(`Encrypted bridge closed (${event.code})`);
-  for (const waiter of waiters.splice(0)) waiter.reject(terminalError);
-});
-socket.addEventListener("error", () => {
-  terminalError = new Error("Encrypted bridge failed");
-  for (const waiter of waiters.splice(0)) waiter.reject(terminalError);
-});
-
-await new Promise((resolveOpen, rejectOpen) => {
-  const timer = setTimeout(() => rejectOpen(new Error("Encrypted bridge open timed out")), 15_000);
-  socket.addEventListener("open", () => { clearTimeout(timer); resolveOpen(); }, { once: true });
-  socket.addEventListener("error", () => { clearTimeout(timer); rejectOpen(new Error("Encrypted bridge could not open")); }, { once: true });
-});
+async function openSocket() {
+  const previous = socket;
+  const current = new WebSocket(websocketURL);
+  socket = current; previous?.close(); queued.length = 0; terminalError = undefined;
+  current.addEventListener("message", (event) => {
+    if (socket !== current) return;
+    const waiter = waiters.shift();
+    if (waiter) waiter.resolve(event.data); else queued.push(event.data);
+  });
+  current.addEventListener("close", (event) => {
+    if (socket !== current) return;
+    terminalError = new Error(`Encrypted bridge closed (${event.code})`);
+    for (const waiter of waiters.splice(0)) waiter.reject(terminalError);
+  });
+  current.addEventListener("error", () => {
+    if (socket !== current) return;
+    terminalError = new Error("Encrypted bridge failed");
+    for (const waiter of waiters.splice(0)) waiter.reject(terminalError);
+  });
+  await new Promise((resolveOpen, rejectOpen) => {
+    const timer = setTimeout(() => rejectOpen(new Error("Encrypted bridge open timed out")), 15_000);
+    current.addEventListener("open", () => { clearTimeout(timer); resolveOpen(); }, { once: true });
+    current.addEventListener("error", () => { clearTimeout(timer); rejectOpen(new Error("Encrypted bridge could not open")); }, { once: true });
+  });
+}
+await openSocket();
 
 async function nextMessage() {
   if (queued.length) return queued.shift();
@@ -78,15 +85,17 @@ async function nextMessage() {
   });
 }
 
-const ready = JSON.parse(await nextMessage());
-if (ready.type !== "bridge_ready" || ready.protocol !== "e2e-v1" || typeof ready.id !== "string") {
+let ready = JSON.parse(await nextMessage());
+if (ready.type !== "bridge_ready" || ready.protocol !== "e2e-v2" || typeof ready.id !== "string") {
   throw new Error("Invalid E2E bridge greeting");
 }
-const key = await deriveEncryptionKey(token);
+let key = await deriveEncryptionKey(token);
+let deviceID = "";
 let sendSequence = 0;
 let receiveSequence = 0;
 async function sendEncrypted(value) {
-  socket.send(await encryptPacket(key, ready.id, "browser", sendSequence, value));
+  const packet = await encryptPacket(key, ready.id, "browser", sendSequence, value);
+  socket.send(bytesToBase64URL(new TextEncoder().encode(JSON.stringify({ v: 2, deviceId: deviceID, packet }))));
   sendSequence += 1;
 }
 async function receiveEncrypted() {
@@ -98,14 +107,25 @@ async function receiveEncrypted() {
 const challengeBytes = new Uint8Array(24);
 crypto.getRandomValues(challengeBytes);
 const challenge = bytesToBase64URL(challengeBytes);
-await sendEncrypted({ v: 1, type: "authenticate", challenge });
+await sendEncrypted({ v: 2, type: "authenticate", challenge });
 const authenticated = await receiveEncrypted();
 if (authenticated.type !== "authenticated" || authenticated.challenge !== challenge) {
   throw new Error("Connector did not prove possession of the browser key");
 }
 
+if (typeof authenticated.deviceId !== "string" || typeof authenticated.secret !== "string") throw new Error("Device credential missing");
+deviceID = authenticated.deviceId;
+key = await deriveEncryptionKey(authenticated.secret);
+await openSocket();
+ready = JSON.parse(await nextMessage());
+if (ready.protocol !== "e2e-v2" || typeof ready.id !== "string") throw new Error("Invalid device bridge greeting");
+sendSequence = 0; receiveSequence = 0;
+await sendEncrypted({ v: 2, type: "authenticate", challenge });
+const resumed = await receiveEncrypted();
+if (resumed.type !== "authenticated" || resumed.challenge !== challenge || resumed.deviceId !== deviceID) throw new Error("Device resume failed");
+
 const requestID = crypto.randomUUID();
-await sendEncrypted({ v: 1, type: "http_request", id: requestID, method: "GET", path: "/api/sessions", body: "" });
+await sendEncrypted({ v: 2, type: "http_request", id: requestID, method: "GET", path: "/api/sessions", body: "" });
 const response = await receiveEncrypted();
 if (response.type !== "http_response" || response.id !== requestID || response.status !== 200) {
   throw new Error("Encrypted session list failed");
@@ -116,7 +136,7 @@ if (apiProbePath) {
   const allowedProbePaths = new Set(["/api/agents", "/api/projects/suggestions", "/api/workflows"]);
   if (!allowedProbePaths.has(apiProbePath)) throw new Error(`Unsupported read-only API probe: ${apiProbePath}`);
   const probeID = crypto.randomUUID();
-  await sendEncrypted({ v: 1, type: "http_request", id: probeID, method: "GET", path: apiProbePath, body: "" });
+  await sendEncrypted({ v: 2, type: "http_request", id: probeID, method: "GET", path: apiProbePath, body: "" });
   let probeResponse;
   do {
     probeResponse = await receiveEncrypted();
@@ -129,7 +149,7 @@ if (apiProbePath) {
   apiProbe = { path: apiProbePath, status: probeResponse.status, json };
   if (apiProbeOnly) {
     socket.close(1000, "Smoke test complete");
-    console.log(JSON.stringify({ authenticated: true, sessions: sessions.length, apiProbe, encryption: "AES-256-GCM e2e-v1" }));
+    console.log(JSON.stringify({ authenticated: true, sessions: sessions.length, apiProbe, encryption: "AES-256-GCM e2e-v2" }));
     setTimeout(() => process.exit(0), 50);
     await new Promise(() => undefined);
   }
@@ -138,7 +158,7 @@ let desktopDenied = false;
 let desktopBridge = false;
 if (testDesktopDisabled) {
   const desktopID = crypto.randomUUID();
-  await sendEncrypted({ v: 1, type: "desktop_open", id: desktopID });
+  await sendEncrypted({ v: 2, type: "desktop_open", id: desktopID });
   let desktopResponse;
   do {
     desktopResponse = await receiveEncrypted();
@@ -150,7 +170,7 @@ if (testDesktopDisabled) {
 }
 if (testDesktopBridge) {
   const desktopID = crypto.randomUUID();
-  await sendEncrypted({ v: 1, type: "desktop_open", id: desktopID });
+  await sendEncrypted({ v: 2, type: "desktop_open", id: desktopID });
   let opened = false;
   let greeting;
   while (!opened || !greeting) {
@@ -162,18 +182,18 @@ if (testDesktopBridge) {
   }
   if (new TextDecoder().decode(greeting) !== "RFB 003.008\n") throw new Error("Remote desktop returned an invalid RFB greeting");
   await sendEncrypted({
-    v: 1,
+    v: 2,
     type: "desktop_data",
     id: desktopID,
     data: bytesToBase64URL(new TextEncoder().encode("RFB 003.008\n")),
   });
-  await sendEncrypted({ v: 1, type: "desktop_close", id: desktopID, code: 1000, reason: "Smoke test complete" });
+  await sendEncrypted({ v: 2, type: "desktop_close", id: desktopID, code: 1000, reason: "Smoke test complete" });
   desktopBridge = true;
 }
 let windowCapture = false;
 if (testWindowCapture) {
   const listID = crypto.randomUUID();
-  await sendEncrypted({ v: 1, type: "window_sources_request", id: listID });
+  await sendEncrypted({ v: 2, type: "window_sources_request", id: listID });
   let listed;
   do {
     listed = await receiveEncrypted();
@@ -186,7 +206,7 @@ if (testWindowCapture) {
     : listed.sources[0];
   if (!source) throw new Error(`Selected-window source did not match: ${wantedWindow}`);
   const windowID = crypto.randomUUID();
-  await sendEncrypted({ v: 1, type: "window_open", id: windowID, windowId: source.id, maxWidth: 960, maxHeight: 720 });
+  await sendEncrypted({ v: 2, type: "window_open", id: windowID, windowId: source.id, maxWidth: 960, maxHeight: 720 });
   let windowOpened = false;
   let frame;
   while (!windowOpened || !frame) {
@@ -198,32 +218,32 @@ if (testWindowCapture) {
   }
   if (frame.length < 4 || frame[0] !== 0xff || frame[1] !== 0xd8 || frame[2] !== 0xff) throw new Error("Selected-window stream returned an invalid JPEG frame");
   if (windowText) {
-    await sendEncrypted({ v: 1, type: "window_input", id: windowID, kind: "text", text: windowText });
+    await sendEncrypted({ v: 2, type: "window_input", id: windowID, kind: "text", text: windowText });
     if (saveWindowText) {
-      await sendEncrypted({ v: 1, type: "window_input", id: windowID, kind: "key", code: "KeyS", down: true, meta: true });
-      await sendEncrypted({ v: 1, type: "window_input", id: windowID, kind: "key", code: "KeyS", down: false, meta: true });
+      await sendEncrypted({ v: 2, type: "window_input", id: windowID, kind: "key", code: "KeyS", down: true, meta: true });
+      await sendEncrypted({ v: 2, type: "window_input", id: windowID, kind: "key", code: "KeyS", down: false, meta: true });
     }
   }
-  await sendEncrypted({ v: 1, type: "window_close", id: windowID, code: 1000, reason: "Smoke test complete" });
+  await sendEncrypted({ v: 2, type: "window_close", id: windowID, code: 1000, reason: "Smoke test complete" });
   windowCapture = true;
 }
 let fileUpload = false;
 if (testFileUpload) {
   const uploadID = crypto.randomUUID();
   const content = new TextEncoder().encode(`Termlinks encrypted upload smoke test ${Date.now()}\n`);
-  await sendEncrypted({ v: 1, type: "file_upload_start", id: uploadID, name: uploadName, size: content.length });
+  await sendEncrypted({ v: 2, type: "file_upload_start", id: uploadID, name: uploadName, size: content.length });
   let uploadResponse = await receiveEncrypted();
   if (uploadResponse.type !== "file_upload_ready" || uploadResponse.id !== uploadID) {
     throw new Error(`Encrypted file upload did not become ready: ${uploadResponse.reason || uploadResponse.type}`);
   }
   await sendEncrypted({
-    v: 1, type: "file_upload_chunk", id: uploadID, offset: 0, data: bytesToBase64URL(content),
+    v: 2, type: "file_upload_chunk", id: uploadID, offset: 0, data: bytesToBase64URL(content),
   });
   uploadResponse = await receiveEncrypted();
   if (uploadResponse.type !== "file_upload_progress" || uploadResponse.id !== uploadID || uploadResponse.received !== content.length) {
     throw new Error(`Encrypted file upload chunk failed: ${uploadResponse.reason || uploadResponse.type}`);
   }
-  await sendEncrypted({ v: 1, type: "file_upload_finish", id: uploadID });
+  await sendEncrypted({ v: 2, type: "file_upload_finish", id: uploadID });
   uploadResponse = await receiveEncrypted();
   if (uploadResponse.type !== "file_upload_complete" || uploadResponse.id !== uploadID || !uploadResponse.path?.endsWith(uploadName)) {
     throw new Error(`Encrypted file upload did not complete: ${uploadResponse.reason || uploadResponse.type}`);
@@ -234,7 +254,7 @@ let session = wantedSession ? sessions.find((item) => item.name === wantedSessio
 if (createShell) {
   const createID = crypto.randomUUID();
   await sendEncrypted({
-    v: 1,
+    v: 2,
     type: "http_request",
     id: createID,
     method: "POST",
@@ -255,7 +275,7 @@ if (createShell) {
 if (!session) throw new Error("Requested smoke-test session was not found");
 
 const terminalID = crypto.randomUUID();
-await sendEncrypted({ v: 1, type: "terminal_open", id: terminalID, sessionId: session.id });
+await sendEncrypted({ v: 2, type: "terminal_open", id: terminalID, sessionId: session.id });
 let opened = false;
 let output = new Uint8Array();
 while (!opened || output.length === 0 || (expectedOutput && !new TextDecoder().decode(output).includes(expectedOutput))) {
@@ -265,7 +285,7 @@ while (!opened || output.length === 0 || (expectedOutput && !new TextDecoder().d
     opened = true;
     if (input) {
       await sendEncrypted({
-        v: 1,
+        v: 2,
         type: "terminal_data",
         id: terminalID,
         binary: true,
@@ -289,10 +309,10 @@ while (!opened || output.length === 0 || (expectedOutput && !new TextDecoder().d
     output = combined;
   }
 }
-await sendEncrypted({ v: 1, type: "terminal_close", id: terminalID, code: 1000, reason: "Smoke test complete" });
+await sendEncrypted({ v: 2, type: "terminal_close", id: terminalID, code: 1000, reason: "Smoke test complete" });
 if (createShell) {
   const stopID = crypto.randomUUID();
-  await sendEncrypted({ v: 1, type: "http_request", id: stopID, method: "POST", path: `/api/sessions/${session.id}/stop`, body: "" });
+  await sendEncrypted({ v: 2, type: "http_request", id: stopID, method: "POST", path: `/api/sessions/${session.id}/stop`, body: "" });
   let stopped;
   do {
     stopped = await receiveEncrypted();
@@ -302,7 +322,7 @@ if (createShell) {
   }
 }
 socket.close(1000, "Smoke test complete");
-console.log(JSON.stringify({ authenticated: true, sessions: sessions.length, terminalOutput: true, keyboardInput: Boolean(input), interactiveShell: createShell, desktopDenied, desktopBridge, windowCapture, fileUpload, apiProbe, encryption: "AES-256-GCM e2e-v1" }));
+console.log(JSON.stringify({ authenticated: true, sessions: sessions.length, terminalOutput: true, keyboardInput: Boolean(input), interactiveShell: createShell, desktopDenied, desktopBridge, windowCapture, fileUpload, apiProbe, encryption: "AES-256-GCM e2e-v2" }));
 // Node's built-in WebSocket can retain the Cloudflare close handshake handle
 // after the protocol assertions have completed successfully.
 setTimeout(() => process.exit(0), 50);

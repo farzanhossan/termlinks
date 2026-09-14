@@ -833,3 +833,19 @@ button { color: inherit; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }
+
+/* Device access and camera dialogs share the portal's existing controls. */
+.profile-dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); overflow: auto; padding: 24px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); color: var(--ink); box-shadow: 0 24px 80px #0005; }
+.profile-dialog::backdrop { background: #0b171ca8; }
+.profile-dialog h2 { margin: 0 0 18px; font-size: 22px; }
+.profile-content { display: grid; gap: 12px; margin-bottom: 20px; }
+.profile-action { width: 100%; padding: 16px; background: #161f19; color: inherit; border: 1px solid var(--line); border-radius: 10px; text-align: left; font: inherit; cursor: pointer; }
+.danger { color: var(--danger); }
+.device-row { display: flex; align-items: center; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+.device-details { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.device-details p, .device-explanation { font-size: 13px; line-height: 1.5; color: var(--muted); }
+.device-details small { color: var(--muted); }
+.scanner-dialog video { display: block; width: 100%; max-height: 42dvh; background: #14221a; border-radius: 12px; }
+.scanner-dialog > button, .scanner-dialog > input { display: block; margin-top: 16px; }
+.qr-scan-button { width: 100%; margin-top: 12px; }
+@media (max-width: 480px) { .profile-dialog { padding: 18px; } .profile-button { padding: 8px; font-size: 12px; } }

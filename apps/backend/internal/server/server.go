@@ -74,6 +74,7 @@ func New(sessions *session.Manager, authManager *auth.Manager, logger *slog.Logg
 
 func (s *Server) ControlHandler() http.Handler {
 	mux := http.NewServeMux()
+	s.authControlRoutes(mux)
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -93,11 +94,12 @@ func (s *Server) ControlHandler() http.Handler {
 
 func (s *Server) WebHandler() http.Handler {
 	mux := http.NewServeMux()
+	s.deviceRoutes(mux)
 	mux.HandleFunc("GET /api/mode", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"mode": "direct"})
 	})
 	mux.HandleFunc("POST /api/login", s.login)
-	mux.HandleFunc("POST /api/logout", s.requireWebAuth(s.logout))
+	mux.HandleFunc("POST /api/logout", s.logout)
 	mux.HandleFunc("GET /api/me", s.requireWebAuth(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
 	}))
@@ -696,14 +698,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	defer r.Body.Close()
-	var input struct {
-		Token string `json:"token"`
-	}
+	var input deviceLogin
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid login request")
 		return
 	}
-	sessionID, expires, err := s.auth.Login(remoteIP(r), input.Token)
+	if input.Label == "" {
+		input.Label = r.UserAgent()
+	}
+	device, sessionID, expires, err := s.auth.LoginDevice(remoteIP(r), input.Token, input.Label, input.Remember)
 	if errors.Is(err, auth.ErrRateLimited) {
 		w.Header().Set("Retry-After", "60")
 		writeError(w, http.StatusTooManyRequests, "too many login attempts")
@@ -713,7 +716,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid token")
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
+	sessionCookie := &http.Cookie{
 		Name:     cookieName,
 		Value:    sessionID,
 		Path:     "/",
@@ -722,8 +725,18 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteStrictMode,
-	})
-	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+	}
+	if !input.Remember {
+		sessionCookie.Expires = time.Time{}
+		sessionCookie.MaxAge = 0
+	}
+	http.SetCookie(w, sessionCookie)
+	if input.Remember {
+		setResumeCookie(w, r, device.Secret)
+	} else {
+		setResumeCookie(w, r, "")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "deviceId": device.ID})
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
@@ -731,9 +744,29 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "cross-origin request rejected")
 		return
 	}
+	id := ""
 	if cookie, err := r.Cookie(cookieName); err == nil {
-		s.auth.Logout(cookie.Value)
+		// An expired cookie grants no access, but can still relinquish its
+		// own device's access, including other tabs and existing streams.
+		id = s.auth.DeviceID(cookie.Value)
+		if id == "" {
+			s.auth.Logout(cookie.Value)
+		}
 	}
+	if id == "" {
+		if resume, err := r.Cookie(resumeCookieName); err == nil {
+			if session, _, err := s.auth.ResumeSecret(resume.Value); err == nil {
+				id = s.auth.DeviceID(session)
+			}
+		}
+	}
+	if id != "" {
+		if err := s.auth.Revoke(id); err != nil {
+			writeError(w, 503, err.Error())
+			return
+		}
+	}
+
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		Value:    "",
@@ -743,6 +776,7 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteStrictMode,
 	})
+	setResumeCookie(w, r, "")
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -750,8 +784,28 @@ func (s *Server) requireWebAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie(cookieName)
 		if err != nil || !s.auth.Valid(cookie.Value) {
-			writeError(w, http.StatusUnauthorized, "authentication required")
-			return
+			resume, resumeErr := r.Cookie(resumeCookieName)
+			if resumeErr != nil {
+				writeError(w, 401, "authentication required")
+				return
+			}
+			session, expires, resumeErr := s.auth.ResumeSecret(resume.Value)
+			if resumeErr != nil {
+				setResumeCookie(w, r, "")
+				writeError(w, 401, "authentication required")
+				return
+			}
+			setSessionCookie(w, r, session, expires)
+			cookie = &http.Cookie{Name: cookieName, Value: session}
+			// Replace the expired request cookie for downstream handlers.
+			cookies := r.Cookies()
+			r.Header.Del("Cookie")
+			for _, c := range cookies {
+				if c.Name != cookieName {
+					r.AddCookie(c)
+				}
+			}
+			r.AddCookie(cookie)
 		}
 		next(w, r)
 	}
@@ -779,6 +833,10 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request, browser, manag
 		return
 	}
 	defer connection.Close()
+	if browser {
+		cookie, _ := r.Cookie(cookieName)
+		defer s.auth.Track(cookie.Value, func() { _ = connection.Close() })()
+	}
 	connection.SetReadLimit(64 << 10)
 	if managedViewer {
 		if !s.viewers.register(current.Info().ID, connection) {
@@ -877,7 +935,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+		w.Header().Set("Permissions-Policy", "camera=(self), microphone=(), geolocation=(), payment=(), usb=()")
 		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/ws/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}

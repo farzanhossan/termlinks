@@ -1,7 +1,6 @@
 package cloud
 
 import (
-	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -28,6 +27,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"termlinks/backend/internal/auth"
 	"termlinks/backend/internal/client"
 	"termlinks/backend/internal/config"
 	"termlinks/backend/internal/remote"
@@ -35,9 +35,9 @@ import (
 )
 
 const (
-	protocolVersion    = 1
-	keyContext         = "termlinks-e2e-v1\x00"
-	aadContext         = "termlinks-e2e-v1:"
+	protocolVersion    = 2
+	keyContext         = "termlinks-e2e-v2\x00"
+	aadContext         = "termlinks-e2e-v2:"
 	maxControlMessage  = 7 << 20
 	maxEncryptedPacket = 5 << 20
 	maxHTTPBody        = 64 << 10
@@ -85,12 +85,16 @@ type authenticateMessage struct {
 	Version   int    `json:"v"`
 	Type      string `json:"type"`
 	Challenge string `json:"challenge"`
+	Label     string `json:"label,omitempty"`
+	Remember  bool   `json:"remember,omitempty"`
 }
 
 type authenticatedMessage struct {
 	Version   int    `json:"v"`
 	Type      string `json:"type"`
 	Challenge string `json:"challenge"`
+	DeviceID  string `json:"deviceId,omitempty"`
+	Secret    string `json:"secret,omitempty"`
 }
 
 type httpRequestMessage struct {
@@ -280,6 +284,13 @@ type fileUpload struct {
 }
 
 type browserChannel struct {
+	ctx           context.Context
+	cancel        context.CancelFunc
+	closed        bool
+	sessionExpiry time.Time
+	selected      bool
+	deviceID      string
+	key           [32]byte
 	mu            sync.Mutex
 	sendMu        sync.Mutex
 	authenticated bool
@@ -294,13 +305,13 @@ type browserChannel struct {
 }
 
 type connectionState struct {
+	authMu          sync.RWMutex
+	authState       auth.Snapshot
 	ctx             context.Context
 	localOrigin     string
-	portalToken     string
 	desktopEnabled  bool
 	vncAddress      string
 	control         *client.Client
-	key             [32]byte
 	outgoing        chan []byte
 	channelsMu      sync.Mutex
 	channels        map[string]*browserChannel
@@ -327,14 +338,13 @@ func Run(ctx context.Context, settings config.CloudSettings, localListen, portal
 		return err
 	}
 	localOrigin := "http://" + localListen
-	key := deriveKey(portalToken)
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 		connectedAt := time.Now()
-		err := runOnce(ctx, connectorURL, settings, localOrigin, portalToken, controlSocket, key)
+		err := runOnce(ctx, connectorURL, settings, localOrigin, controlSocket)
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -386,7 +396,7 @@ func RelayStatus(ctx context.Context, relayURL string) (bool, error) {
 	return status.Online, nil
 }
 
-func runOnce(ctx context.Context, connectorURL string, settings config.CloudSettings, localOrigin, portalToken, controlSocket string, key [32]byte) error {
+func runOnce(ctx context.Context, connectorURL string, settings config.CloudSettings, localOrigin, controlSocket string) error {
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+settings.ConnectorToken)
 	headers.Set("User-Agent", "termlinks-connector/0.3")
@@ -404,11 +414,24 @@ func runOnce(ctx context.Context, connectorURL string, settings config.CloudSett
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	state := &connectionState{
-		ctx: runCtx, localOrigin: localOrigin, portalToken: portalToken, key: key,
+		ctx: runCtx, localOrigin: localOrigin,
 		desktopEnabled: settings.DesktopEnabled, vncAddress: settings.VNCAddress,
 		control:  client.New(controlSocket),
 		outgoing: make(chan []byte, 256), channels: make(map[string]*browserChannel),
 		uploadDirectory: defaultUploadDirectory(),
+	}
+	authReady := make(chan struct{})
+	authErrors := make(chan error, 1)
+	var readyOnce sync.Once
+	go func() {
+		authErrors <- state.control.WatchAuth(runCtx, func(snapshot auth.Snapshot) { state.applyAuth(snapshot); readyOnce.Do(func() { close(authReady) }) })
+	}()
+	select {
+	case <-authReady:
+	case err := <-authErrors:
+		return fmt.Errorf("device authentication unavailable: %w", err)
+	case <-ctx.Done():
+		return nil
 	}
 	writerErrors := make(chan error, 1)
 	go func() { writerErrors <- writeRelay(runCtx, connection, state.outgoing) }()
@@ -421,6 +444,9 @@ func runOnce(ctx context.Context, connectorURL string, settings config.CloudSett
 	case <-ctx.Done():
 		state.closeAllChannels()
 		return nil
+	case err := <-authErrors:
+		state.closeAllChannels()
+		return fmt.Errorf("device authentication subscription lost: %w", err)
 	case err := <-writerErrors:
 		state.closeAllChannels()
 		return err
@@ -492,8 +518,10 @@ func readRelay(connection *websocket.Conn, state *connectionState) error {
 }
 
 func (state *connectionState) openChannel(id string) {
+	ctx, cancel := context.WithCancel(state.ctx)
 	jar, _ := cookiejar.New(nil)
 	channel := &browserChannel{
+		ctx: ctx, cancel: cancel,
 		httpClient: &http.Client{Jar: jar, Timeout: 12 * time.Second},
 		sockets:    make(map[string]*localSocket),
 		desktops:   make(map[string]*desktopSocket),
@@ -529,7 +557,15 @@ func (state *connectionState) handleEncrypted(channelID, packet string) {
 	channel.mu.Lock()
 	receiveSequence := channel.receiveSeq
 	channel.mu.Unlock()
-	plaintext, err := decryptPacket(state.key, channelID, "browser", receiveSequence, packet)
+	packet, ok := state.selectDevice(channelID, channel, packet)
+	if !ok {
+		state.closeChannel(channelID, 1008, "Device authentication required", true)
+		return
+	}
+	channel.mu.Lock()
+	key := channel.key
+	channel.mu.Unlock()
+	plaintext, err := decryptPacket(key, channelID, "browser", receiveSequence, packet)
 	if err != nil || len(plaintext) > maxControlMessage {
 		state.closeChannel(channelID, websocket.ClosePolicyViolation, "Authentication failed", true)
 		return
@@ -549,13 +585,17 @@ func (state *connectionState) handleEncrypted(channelID, packet string) {
 	}
 	channel.mu.Lock()
 	authenticated := channel.authenticated
+	closed := channel.closed
 	channel.mu.Unlock()
+	if closed {
+		return
+	}
 	if !authenticated {
 		if kind.Type != "authenticate" {
 			state.closeChannel(channelID, websocket.ClosePolicyViolation, "Authentication required", true)
 			return
 		}
-		state.authenticateChannel(channelID, channel, plaintext)
+		state.deviceAuthentication(channelID, channel, plaintext)
 		return
 	}
 	switch kind.Type {
@@ -679,7 +719,7 @@ func (state *connectionState) openDesktop(channelID string, channel *browserChan
 		return
 	}
 	channel.mu.Lock()
-	if len(channel.desktops) != 0 || len(channel.windows) != 0 {
+	if channel.closed || len(channel.desktops) != 0 || len(channel.windows) != 0 {
 		channel.mu.Unlock()
 		_ = state.sendEncrypted(channelID, desktopCloseMessage{Version: protocolVersion, Type: "desktop_close", ID: message.ID, Code: websocket.ClosePolicyViolation, Reason: "A remote desktop is already open in this portal connection"})
 		return
@@ -687,14 +727,14 @@ func (state *connectionState) openDesktop(channelID string, channel *browserChan
 	channel.mu.Unlock()
 
 	dialer := net.Dialer{Timeout: 3 * time.Second}
-	connection, err := dialer.DialContext(state.ctx, "tcp", state.vncAddress)
+	connection, err := dialer.DialContext(state.channelContext(channel), "tcp", state.vncAddress)
 	if err != nil {
 		_ = state.sendEncrypted(channelID, desktopCloseMessage{Version: protocolVersion, Type: "desktop_close", ID: message.ID, Code: websocket.CloseTryAgainLater, Reason: "Local Screen Sharing is unavailable"})
 		return
 	}
 	socket := &desktopSocket{connection: connection}
 	channel.mu.Lock()
-	if len(channel.desktops) != 0 || len(channel.windows) != 0 {
+	if channel.closed || len(channel.desktops) != 0 || len(channel.windows) != 0 {
 		channel.mu.Unlock()
 		_ = connection.Close()
 		_ = state.sendEncrypted(channelID, desktopCloseMessage{Version: protocolVersion, Type: "desktop_close", ID: message.ID, Code: websocket.ClosePolicyViolation, Reason: "A remote desktop is already open in this portal connection"})
@@ -750,7 +790,7 @@ func (state *connectionState) openWindow(channelID string, channel *browserChann
 		return
 	}
 	channel.mu.Lock()
-	if len(channel.desktops) != 0 || len(channel.windows) != 0 {
+	if channel.closed || len(channel.desktops) != 0 || len(channel.windows) != 0 {
 		channel.mu.Unlock()
 		closeWith(websocket.ClosePolicyViolation, "Another remote view is already open in this portal connection")
 		return
@@ -762,10 +802,10 @@ func (state *connectionState) openWindow(channelID string, channel *browserChann
 		closeWith(websocket.CloseTryAgainLater, err.Error())
 		return
 	}
-	captureContext, cancel := context.WithCancel(state.ctx)
+	captureContext, cancel := context.WithCancel(state.channelContext(channel))
 	socket := &windowSocket{capture: capture, cancel: cancel}
 	channel.mu.Lock()
-	if len(channel.desktops) != 0 || len(channel.windows) != 0 {
+	if channel.closed || len(channel.desktops) != 0 || len(channel.windows) != 0 {
 		channel.mu.Unlock()
 		cancel()
 		capture.Close()
@@ -909,40 +949,11 @@ func (state *connectionState) writeDesktop(channelID string, channel *browserCha
 	}
 }
 
-func (state *connectionState) authenticateChannel(channelID string, channel *browserChannel, plaintext []byte) {
-	var message authenticateMessage
-	if json.Unmarshal(plaintext, &message) != nil || len(message.Challenge) < 16 || len(message.Challenge) > 256 {
-		state.closeChannel(channelID, websocket.ClosePolicyViolation, "Authentication failed", true)
-		return
-	}
-	body, _ := json.Marshal(map[string]string{"token": state.portalToken})
-	request, err := http.NewRequestWithContext(state.ctx, http.MethodPost, state.localOrigin+"/api/login", bytes.NewReader(body))
-	if err != nil {
-		state.closeChannel(channelID, websocket.CloseInternalServerErr, "Local authentication failed", true)
-		return
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Origin", state.localOrigin)
-	response, err := channel.httpClient.Do(request)
-	if err != nil {
-		state.closeChannel(channelID, websocket.CloseTryAgainLater, "Local portal is unavailable", true)
-		return
-	}
-	_ = response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		state.closeChannel(channelID, websocket.ClosePolicyViolation, "Local authentication failed", true)
-		return
-	}
-	channel.mu.Lock()
-	channel.authenticated = true
-	if channel.authTimer != nil {
-		channel.authTimer.Stop()
-	}
-	channel.mu.Unlock()
-	_ = state.sendEncrypted(channelID, authenticatedMessage{Version: protocolVersion, Type: "authenticated", Challenge: message.Challenge})
-}
-
 func (state *connectionState) handleHTTPRequest(channelID string, channel *browserChannel, message httpRequestMessage) {
+	if err := state.refreshDeviceSession(channel); err != nil {
+		state.closeChannel(channelID, 1008, "Device session expired", true)
+		return
+	}
 	if !allowedHTTPRoute(message.Method, message.Path) || len(message.Body) > maxHTTPBody {
 		state.sendHTTPError(channelID, message.ID, http.StatusForbidden, "API route is not allowed")
 		return
@@ -960,7 +971,7 @@ func (state *connectionState) handleHTTPRequest(channelID string, channel *brows
 		state.sendHTTPError(channelID, message.ID, http.StatusBadRequest, "Invalid API path")
 		return
 	}
-	request, err := http.NewRequestWithContext(state.ctx, message.Method, target, strings.NewReader(message.Body))
+	request, err := http.NewRequestWithContext(state.channelContext(channel), message.Method, target, strings.NewReader(message.Body))
 	if err != nil {
 		state.sendHTTPError(channelID, message.ID, http.StatusBadRequest, "Invalid API request")
 		return
@@ -987,6 +998,12 @@ func (state *connectionState) handleHTTPRequest(channelID string, channel *brows
 }
 
 func (state *connectionState) createInteractiveShell(channelID string, message httpRequestMessage) {
+	state.channelsMu.Lock()
+	channel := state.channels[channelID]
+	state.channelsMu.Unlock()
+	if channel == nil {
+		return
+	}
 	request, err := remote.DecodeStartRequest(strings.NewReader(message.Body))
 	if err != nil {
 		state.sendHTTPError(channelID, message.ID, http.StatusBadRequest, err.Error())
@@ -997,7 +1014,7 @@ func (state *connectionState) createInteractiveShell(channelID string, message h
 		state.sendHTTPError(channelID, message.ID, http.StatusBadRequest, err.Error())
 		return
 	}
-	created, err := state.control.Create(state.ctx, options)
+	created, err := state.control.Create(state.channelContext(channel), options)
 	if err != nil {
 		state.sendHTTPError(channelID, message.ID, http.StatusBadRequest, err.Error())
 		return
@@ -1032,7 +1049,7 @@ func (state *connectionState) openLocalSocket(channelID string, channel *browser
 			headers.Add("Cookie", cookie.String())
 		}
 	}
-	connection, response, err := (&websocket.Dialer{HandshakeTimeout: 5 * time.Second}).DialContext(state.ctx, target, headers)
+	connection, response, err := (&websocket.Dialer{HandshakeTimeout: 5 * time.Second}).DialContext(state.channelContext(channel), target, headers)
 	if err != nil {
 		code := websocket.CloseTryAgainLater
 		reason := "Local terminal is unavailable"
@@ -1049,6 +1066,11 @@ func (state *connectionState) openLocalSocket(channelID string, channel *browser
 	connection.SetReadLimit(maxTerminalOutput)
 	socket := &localSocket{connection: connection}
 	channel.mu.Lock()
+	if channel.closed {
+		channel.mu.Unlock()
+		_ = connection.Close()
+		return
+	}
 	if previous := channel.sockets[message.ID]; previous != nil {
 		_ = previous.connection.Close()
 	}
@@ -1162,7 +1184,7 @@ func (state *connectionState) startFileUpload(channelID string, channel *browser
 		return
 	}
 	channel.mu.Lock()
-	if _, exists := channel.uploads[message.ID]; exists || len(channel.uploads) >= 2 {
+	if _, exists := channel.uploads[message.ID]; channel.closed || exists || len(channel.uploads) >= 2 {
 		channel.mu.Unlock()
 		state.uploadError(channelID, message.ID, "Too many active file uploads")
 		return
@@ -1181,7 +1203,7 @@ func (state *connectionState) startFileUpload(channelID string, channel *browser
 	_ = file.Chmod(0o600)
 	upload := &fileUpload{file: file, tempPath: file.Name(), name: message.Name, size: message.Size}
 	channel.mu.Lock()
-	if _, exists := channel.uploads[message.ID]; exists || len(channel.uploads) >= 2 {
+	if _, exists := channel.uploads[message.ID]; channel.closed || exists || len(channel.uploads) >= 2 {
 		channel.mu.Unlock()
 		cleanupFileUpload(upload)
 		state.uploadError(channelID, message.ID, "Too many active file uploads")
@@ -1331,10 +1353,21 @@ func (state *connectionState) sendEncrypted(channelID string, value any) error {
 	channel.sendMu.Lock()
 	defer channel.sendMu.Unlock()
 	channel.mu.Lock()
+	if channel.closed {
+		channel.mu.Unlock()
+		return errors.New("device channel closed")
+	}
 	sequence := channel.sendSeq
 	channel.sendSeq++
 	channel.mu.Unlock()
-	packet, err := encryptPacket(state.key, channelID, "connector", sequence, value)
+	channel.mu.Lock()
+	key := channel.key
+	selected := channel.selected
+	channel.mu.Unlock()
+	if !selected {
+		return errors.New("device key has not been selected")
+	}
+	packet, err := encryptPacket(key, channelID, "connector", sequence, value)
 	if err != nil {
 		return err
 	}
@@ -1364,6 +1397,10 @@ func (state *connectionState) closeChannel(id string, code int, reason string, n
 	state.channelsMu.Unlock()
 	if channel != nil {
 		channel.mu.Lock()
+		channel.closed = true
+		if channel.cancel != nil {
+			channel.cancel()
+		}
 		if channel.authTimer != nil {
 			channel.authTimer.Stop()
 		}
@@ -1562,6 +1599,13 @@ func allowedHTTPRoute(method, requestPath string) bool {
 		return false
 	}
 	path := parsed.Path
+	if (method == http.MethodGet && path == "/api/devices") || (method == http.MethodPost && path == "/api/devices/heartbeat") {
+		return true
+	}
+	if method == http.MethodDelete && strings.HasPrefix(path, "/api/devices/") {
+		id := strings.TrimPrefix(path, "/api/devices/")
+		return len(id) == 43 && !strings.Contains(id, "/")
+	}
 	if method == http.MethodPost && path == "/api/logout" {
 		return true
 	}
@@ -1683,4 +1727,11 @@ func boundedReason(reason string) string {
 		data = data[:len(data)-1]
 	}
 	return string(data)
+}
+
+func (state *connectionState) channelContext(channel *browserChannel) context.Context {
+	if channel.ctx != nil {
+		return channel.ctx
+	}
+	return state.ctx
 }

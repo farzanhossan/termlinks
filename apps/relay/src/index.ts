@@ -96,7 +96,7 @@ export class TermlinksRelay extends DurableObject<Env> {
     const relaySide = pair[1];
     relaySide.serializeAttachment({ role: "connector" } satisfies SocketAttachment);
     this.ctx.acceptWebSocket(relaySide, ["connector"]);
-    relaySide.send(JSON.stringify({ type: "connected", protocol: "e2e-v1" }));
+    relaySide.send(JSON.stringify({ type: "connected", protocol: "e2e-v2" }));
     return new Response(null, { status: 101, webSocket: browserSide });
   }
 
@@ -114,7 +114,7 @@ export class TermlinksRelay extends DurableObject<Env> {
     this.ctx.acceptWebSocket(relaySide, ["browser", `channel:${channel}`]);
     try {
       connector.send(JSON.stringify({ type: "channel_open", id: channel }));
-      relaySide.send(JSON.stringify({ type: "bridge_ready", id: channel, protocol: "e2e-v1" }));
+      relaySide.send(JSON.stringify({ type: "bridge_ready", id: channel, protocol: "e2e-v2" }));
     } catch {
       relaySide.close(1012, "Your computer is offline");
     }

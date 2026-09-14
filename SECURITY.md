@@ -8,17 +8,17 @@ Termlinks provides remote keyboard access to local processes and can optionally 
 - Wildcard binds such as `0.0.0.0` and `[::]` are refused unless `--allow-public-bind` is explicitly supplied.
 - Local process creation is available only through a Unix-domain control socket inside a `0700` state directory; the socket is `0600`.
 - The authenticated portal can create only a normal interactive shell with an optional name and starting directory. It cannot submit a separate executable, argument vector, or custom environment, although commands typed into the shell have the user's full permissions.
-- A random 256-bit bearer token is stored in a `0600` file. The local portal exchanges it for a random, `HttpOnly`, `SameSite=Strict` browser cookie that expires after 12 hours.
+- A random 256-bit bearer token is stored in a `0600` file. The local portal issues a device-associated `HttpOnly`, `SameSite=Strict` browser session lasting 12 hours. Remembered direct logins also receive an HttpOnly device cookie (one-year browser retention) that renews sessions until revoked.
 - Login attempts are rate-limited by direct peer IP. Proxy forwarding headers are not trusted.
 - State-changing browser requests and WebSocket upgrades require an exact same-origin request.
 - Request/input sizes, terminal dimensions, scrollback, session count, and HTTP headers are bounded.
-- The portal uses a restrictive Content Security Policy, refuses framing, disables sensitive browser features, and does not store the login token in browser storage.
+- The portal uses a restrictive Content Security Policy, refuses framing, permits same-origin camera use for QR scanning while disabling other sensitive browser features, and does not store the login token in browser storage.
 - The PWA service worker caches only the static app shell, manifest, and icons. It bypasses `/api/`, `/ws/`, non-GET requests, cross-origin traffic, tokens, session metadata, terminal output, and keystrokes.
 - Command names, arguments, paths, and terminal output are inserted into the page as text, not HTML.
 - The optional cloud connector makes an outbound authenticated WSS connection; the local portal remains bound to loopback and no inbound port is opened.
-- The public browser derives an AES-256-GCM key from the portal token and proves possession with an encrypted random challenge. The token itself never crosses the network or enters browser storage.
+- The public browser uses a token-derived AES-256-GCM key only to register a device with an encrypted challenge. It then reconnects using a separate random device key. The token never crosses the relay or enters app-managed browser storage. The private device registry stores secrets under the same operating-system user boundary as the portal token.
 - Public API requests, responses, session metadata, terminal output, and keystrokes remain application-encrypted between the browser and local connector. Cloudflare relays opaque ciphertext and connection metadata only.
-- The local connector decrypts and accepts only explicitly allowlisted logout, session, AI-agent discovery, project-suggestion, workflow, and team-room message operations with validated opaque IDs. It cannot proxy arbitrary localhost paths. Shell creation is forwarded over the private Unix control socket.
+- The local connector decrypts and accepts only explicitly allowlisted device-management, logout, session, AI-agent discovery, project-suggestion, workflow, and team-room message operations with validated opaque IDs. It cannot proxy arbitrary localhost paths. Shell creation is forwarded over the private Unix control socket.
 - AI workflow and team-room mutation routes require both portal authentication and exact same-origin validation. Request bodies reject unknown fields, trailing JSON, oversized input, invalid IDs, cross-room replies, missing directories, and explicit agents that are not ready.
 - AI tools are discovered through bounded executable/version/status checks. Termlinks never reads or stores provider tokens. Only verified Codex and Claude stdin adapters are executable in this initial version; detected unsupported harnesses are labeled adapter-pending.
 - Workflow task text is streamed into the child PTY rather than interpolated through a shell or placed in process arguments. Saved PTY output has terminal control bytes removed and is bounded before entering private SQLite state.
@@ -52,7 +52,7 @@ The state directory is shown by `termlinks doctor`. On macOS it normally lives u
 ## Important limitations
 
 - The local listener has no built-in TLS and is safe only on localhost, an SSH tunnel, or an encrypted private network. A public reverse tunnel must provide HTTPS/WSS and should add its own identity gate.
-- There is no multi-user authorization, per-command permission system, audit log, or device revocation UI.
+- There is no multi-user authorization, per-command permission system, audit log, or per-device permission levels.
 - One deployment represents one configured computer. Reusing its connector credential on a second computer is unsupported and can cause connector replacement; multi-device pairing and routing are not implemented.
 - Any authenticated browser can create an interactive shell, send arbitrary bytes to every managed running terminal, and request that a session stop.
 - An authenticated browser can upload arbitrary file content (up to 100 MiB per file) into the fixed uploads directory and can cause a visible terminal window to open in the logged-in desktop session.
@@ -73,3 +73,17 @@ The state directory is shown by `termlinks doctor`. On macOS it normally lives u
 - Offline PWA launch provides only the cached interface. Terminal access still requires an online computer and connector. A device remembered during hosted login can reconnect with its origin-scoped non-exportable key after a fresh app process; explicit logout or cleared site data requires the portal token again.
 
 For these reasons, this MVP is appropriate for personal use on trusted devices, not shared hosts or a public SaaS service.
+
+## Device removal, rotation, and QR login
+
+`termlinks token --rotate` atomically replaces the shared token and revokes all device credentials and sessions. The daemon remains running, preserving managed PTYs. The connector subscribes to private authentication snapshots over the protected Unix socket; it closes revoked channels before acknowledging the update and stops serving browsers if that subscription fails. If acknowledgement fails, rotation reports that revocation could not be confirmed rather than claiming success.
+
+HTTP session expiry removes API access. The daemon retains the session hash’s device ownership until device revocation or daemon restart solely so an expired cookie can still log out its own device. This does not allow session renewal or new streams. Existing streams belong to the device across HTTP-session renewal, so removing another device cannot close them.
+
+Any signed-in device can list and remove devices under the existing single-owner model. Removal permanently invalidates that credential, including remembered keys and cookies. It cannot prevent someone with the current shared token from registering a new credential. Rotate a compromised shared token. Device labels are browser-supplied descriptions, not verified hardware identities or an audit trail.
+
+QR links contain the shared token in the fragment, never a query parameter; the app removes the fragment before logging in. Anyone who photographs the QR can use the token until rotation. The browser may independently offer to save the token in a password manager; the application does not control password-manager entries.
+
+Offline logout records a local signed-out marker and clears app-managed credentials, but cannot revoke a credential on an unreachable computer or immediately expire an HttpOnly cookie there. The UI reports this distinction; use another device to revoke it when the computer is available. Clearing browser storage can also clear that marker.
+
+The v2 encrypted protocol requires the daemon, connector, relay and portal to be upgraded together. Legacy remembered master keys are discarded; users sign in once to register a device. There is no v1 compatibility bypass.
