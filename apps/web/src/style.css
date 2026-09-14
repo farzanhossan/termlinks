@@ -139,6 +139,18 @@ button { color: inherit; }
   color: #91a099; background: #111814; font: 700 10px/1 ui-monospace, monospace; text-align: center;
 }
 .session-section-list { display: grid; gap: 10px; }
+.session-section-list[hidden] { display: none; }
+.saved-section-heading { margin: 0; }
+.saved-section-toggle {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 12px;
+  width: 100%; min-height: 48px; padding: 10px 14px; border: 1px solid #2d3933; border-radius: 12px;
+  color: #c7d2cc; background: #111814; text-align: left; cursor: pointer; touch-action: manipulation;
+}
+.saved-section-toggle:hover { border-color: #516158; background: #151d19; }
+.saved-section-toggle:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.saved-section-toggle[aria-expanded="true"] { border-color: #477156; background: #132219; }
+.saved-section-chevron { color: #91a099; font: 22px/1 ui-monospace, monospace; }
+.saved-section-toggle[aria-expanded="true"] .saved-section-chevron { transform: rotate(90deg); }
 .session-card {
   width: 100%; overflow: hidden; border: 1px solid var(--line); border-radius: 14px; text-align: left;
   background: linear-gradient(150deg, #131a16, #0e1411); box-shadow: 0 10px 28px rgba(0,0,0,.13);
@@ -683,6 +695,71 @@ button { color: inherit; }
 .terminal-page[data-input-mode="direct"] .terminal-composer-hint { display: none; }
 .terminal-page[data-input-mode="direct"] .terminal-direct-hint { display: block; }
 .terminal-page[data-input-mode="direct"] .terminal-composer { padding-top: 2px; }
+
+.terminal-input-controls { display: flex; min-width: 0; align-items: center; gap: 7px; }
+.terminal-input-controls .extra-keys { flex: 1; min-width: 0; }
+.terminal-app-keyboard-button {
+  flex: 0 0 auto; min-height: 36px; padding: 0 10px; border: 1px solid #2d4657; border-radius: 8px;
+  color: #9eddf5; background: #10202b; font: 700 10px/1.2 ui-monospace, monospace; cursor: pointer;
+}
+.terminal-app-keyboard-button[aria-expanded="true"] { color: #071019; background: var(--terminal-accent); }
+.terminal-shift-button[aria-pressed="true"] { color: #071019; border-color: var(--terminal-accent); background: var(--terminal-accent); }
+.terminal-shift-button:focus-visible, .terminal-tab-key:focus-visible { outline: 2px solid var(--terminal-accent); outline-offset: 2px; }
+.app-keyboard-key[data-key="Backspace"] { -webkit-touch-callout: none; }
+.app-keyboard-open .terminal-input-controls { padding: 6px 0; }
+.app-keyboard-open .extra-keys, .app-keyboard-open .terminal-composer-panel,
+.app-keyboard-open .terminal-composer-hint, .terminal-page .app-keyboard-open .terminal-direct-hint { display: none; }
+.terminal-app-keyboard {
+  container: app-keyboard / inline-size;
+  width: 100%; min-width: 0; max-height: min(420px, calc(var(--terminal-viewport-height, 100dvh) * .52));
+  overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain;
+  padding: 8px; border: 1px solid #2d3c48; border-radius: 12px; background: #0b111b;
+}
+.terminal-app-keyboard[hidden] { display: none; }
+.app-keyboard-toolbar {
+  position: sticky; z-index: 1; top: -8px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 6px; max-width: 960px; margin: 0 auto 8px; padding: 4px 0; background: #0b111b;
+}
+.app-keyboard-layouts { display: flex; gap: 4px; }
+.app-keyboard-layout, .app-keyboard-close, .app-keyboard-symbols {
+  min-height: 40px; padding: 0 12px; border: 1px solid #293743; border-radius: 7px;
+  color: #a7b4bf; background: #121a22; font: 11px/1 ui-monospace, monospace; cursor: pointer;
+}
+.app-keyboard-layout[aria-pressed="true"], .app-keyboard-symbols[aria-pressed="true"] { border-color: #5cc8f5; color: #b9e9fb; background: #183044; }
+.app-keyboard-symbols { display: none; }
+.app-keyboard-keys { max-width: 960px; min-width: 0; margin: auto; }
+.app-keyboard-full { display: grid; gap: 5px; }
+.app-keyboard-compact { display: none; }
+.app-keyboard-row { display: flex; min-width: 0; gap: 4px; }
+.app-keyboard-key {
+  flex: 1 1 0; min-width: 0; height: clamp(36px, 5cqi, 44px); padding: 0 2px; border: 1px solid #293743; border-radius: 6px;
+  color: #d7dee9; background: #18232e; font: 14px/1 ui-monospace, monospace; white-space: nowrap;
+  touch-action: manipulation; user-select: none; -webkit-user-select: none; cursor: pointer;
+}
+.app-keyboard-key.app-keyboard-wide { flex-grow: 1.5; font-size: 11px; }
+.app-keyboard-key.app-keyboard-space { flex-grow: 5; }
+.app-keyboard-key:active, .app-keyboard-key[aria-pressed="true"] { color: #071019; border-color: #5cc8f5; background: #5cc8f5; }
+.app-keyboard-key:disabled { opacity: .38; cursor: not-allowed; }
+.app-keyboard-utility-row .app-keyboard-key { height: 36px; font-size: 11px; }
+.app-keyboard-hint { max-width: 960px; margin: 8px auto 0; color: #81909d; font: 10px/1.4 ui-monospace, monospace; }
+.terminal-app-keyboard button:focus-visible, .terminal-app-keyboard-button:focus-visible { outline: 2px solid #5cc8f5; outline-offset: 2px; }
+@container app-keyboard (max-width: 600px) {
+  .app-keyboard-full { display: none; }
+  .app-keyboard-compact { display: grid; gap: 5px; }
+  .app-keyboard-symbols { display: block; }
+  .app-keyboard-layout, .app-keyboard-close, .app-keyboard-symbols { padding: 0 8px; }
+  .app-keyboard-row { gap: clamp(2px, .7cqi, 4px); }
+  .app-keyboard-key { height: clamp(40px, 9cqi, 48px); font-size: clamp(13px, 3.5cqi, 16px); }
+  .app-keyboard-key.app-keyboard-wide { font-size: clamp(10px, 2.8cqi, 13px); }
+  .app-keyboard-key.app-keyboard-space { flex-grow: 3; }
+  .app-keyboard-scroll-row {
+    overflow-x: auto; overscroll-behavior-x: contain; padding-bottom: 5px;
+    scrollbar-width: thin; scrollbar-color: #344451 transparent;
+  }
+  .app-keyboard-scroll-row .app-keyboard-key { flex: 0 0 44px; height: 40px; }
+  .app-keyboard-symbol-row, .app-keyboard-show-symbols .app-keyboard-letters { display: none; }
+  .app-keyboard-show-symbols .app-keyboard-symbol-row { display: flex; }
+}
 
 .desktop-page {
   width: 100%; height: 100dvh; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto auto;

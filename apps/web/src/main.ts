@@ -19,6 +19,9 @@ import { directAttachmentInput, insertAttachmentPath } from "./terminal-attachme
 import { terminalPasteInput } from "./terminal-clipboard";
 import { TerminalReplyGate } from "./terminal-reply-gate";
 import { binaryStringToBytes, consumeTouchWheel } from "./terminal-touch";
+import { createTerminalKeyboard, terminalKeyboardInput } from "./terminal-keyboard";
+import { TerminalShift } from "./terminal-key-controls";
+import { installTerminalShiftInput } from "./terminal-shift-input";
 import "./style.css";
 
 type Session = {
@@ -198,6 +201,8 @@ const state: {
   touchCleanup?: () => void;
   touchSync?: () => void;
   layoutCleanup?: () => void;
+  keyboardControls?: ReturnType<typeof createTerminalKeyboard>;
+  shiftInput?: ReturnType<typeof installTerminalShiftInput>;
   resizeTimer?: number;
   lastResize?: string;
   terminalReconnectTimer?: number;
@@ -2741,14 +2746,32 @@ function renderTermAdsTeaser(): HTMLElement {
   return teaser;
 }
 
+const dashboardSections = new WeakMap<HTMLElement, {
+  running: HTMLElement;
+  favorites: ReturnType<typeof renderSavedTerminalSection>;
+  history: ReturnType<typeof renderSavedTerminalSection>;
+}>();
+
 function renderSessionCards(container: HTMLElement): void {
   const groups = visibleSavedGroups(state.savedTerminals, new Set(state.sessions.map((item) => item.id)));
-  container.replaceChildren();
-  container.append(
-    renderRunningTerminalSection(),
-    renderSavedTerminalSection("Favorites", groups.favorites),
-    renderSavedTerminalSection("Recent history", groups.recent),
-  );
+  let sections = dashboardSections.get(container);
+  const running = renderRunningTerminalSection();
+  if (!sections) {
+    sections = {
+      running,
+      favorites: renderSavedTerminalSection("Favorites", "favorites", "No favorites saved"),
+      history: renderSavedTerminalSection("History", "history", "No recent history"),
+    };
+    dashboardSections.set(container, sections);
+    container.replaceChildren(running, sections.favorites.element, sections.history.element);
+  } else {
+    // Keep the disclosure buttons mounted: polling must not reset their state
+    // or interrupt keyboard focus while refreshing the terminal cards.
+    sections.running.replaceWith(running);
+    sections.running = running;
+  }
+  sections.favorites.update(groups.favorites);
+  sections.history.update(groups.recent);
 }
 
 function renderRunningTerminalSection(): HTMLElement {
@@ -2768,16 +2791,44 @@ function renderRunningTerminalSection(): HTMLElement {
   return section;
 }
 
-function renderSavedTerminalSection(title: string, savedTerminals: SavedTerminal[]): HTMLElement {
-  const section = renderDashboardSection(title, savedTerminals.length);
+function renderSavedTerminalSection(title: string, key: "favorites" | "history", emptyMessage: string) {
+  const section = el("section", "session-section saved-terminal-section");
+  const heading = el("h2", "saved-section-heading");
+  const toggle = el("button", "saved-section-toggle");
+  toggle.type = "button";
+  toggle.id = `saved-${key}-toggle`;
+  toggle.setAttribute("aria-expanded", "false");
+  toggle.setAttribute("aria-controls", `saved-${key}-list`);
+  section.setAttribute("aria-labelledby", toggle.id);
+  const count = el("span", "session-section-count", "0");
+  const chevron = el("span", "saved-section-chevron", "›");
+  chevron.setAttribute("aria-hidden", "true");
+  toggle.append(el("span", "session-section-title", title), count, chevron);
+  heading.append(toggle);
   const list = el("div", "session-section-list");
-  if (savedTerminals.length === 0) {
-    list.append(el("p", "saved-empty", title === "Favorites" ? "No favorites saved" : "No recent history"));
-  } else {
-    for (const saved of savedTerminals) list.append(renderSavedTerminalCard(saved));
-  }
-  section.append(list);
-  return section;
+  list.id = `saved-${key}-list`;
+  list.hidden = true;
+  let currentTerminals: SavedTerminal[] = [];
+  const renderList = (): void => {
+    list.replaceChildren();
+    if (list.hidden) return;
+    if (currentTerminals.length === 0) list.append(el("p", "saved-empty", emptyMessage));
+    else for (const saved of currentTerminals) list.append(renderSavedTerminalCard(saved));
+  };
+  toggle.addEventListener("click", () => {
+    list.hidden = !list.hidden;
+    toggle.setAttribute("aria-expanded", String(!list.hidden));
+    renderList();
+  });
+  section.append(heading, list);
+  return {
+    element: section,
+    update: (savedTerminals: SavedTerminal[]): void => {
+      currentTerminals = savedTerminals;
+      count.textContent = String(savedTerminals.length);
+      renderList();
+    },
+  };
 }
 
 function renderDashboardSection(title: string, count: number): HTMLElement {
@@ -3147,7 +3198,8 @@ function renderTerminal(id: string, workflowID?: string): void {
   tuiHint.hidden = true;
   tuiHint.setAttribute("aria-live", "polite");
   frame.append(mount, sync, tuiHint);
-  const composer = renderTerminalComposer();
+  const shift = new TerminalShift();
+  const composer = renderTerminalComposer(shift);
   const attachFromTerminalBar = (): void => {
     const currentMode = parseTerminalInputMode(page.dataset.inputMode);
     composer.dispatchEvent(new CustomEvent("termlinks:attach", { detail: { direct: currentMode === "direct" } }));
@@ -3179,6 +3231,12 @@ function renderTerminal(id: string, workflowID?: string): void {
   terminal.loadAddon(fit);
   terminal.open(mount);
   state.terminal = terminal;
+  state.shiftInput = installTerminalShiftInput({
+    root: page, shift,
+    connected: () => state.socket?.readyState === WebSocket.OPEN,
+    send: sendTerminalInput,
+    applicationCursor: () => terminal.modes.applicationCursorKeysMode,
+  });
   state.terminalSessionID = session.id;
   state.terminalSnapshotApplied = false;
   const terminalReplyGate = new TerminalReplyGate();
@@ -3221,6 +3279,7 @@ function renderTerminal(id: string, workflowID?: string): void {
     setTerminalInputStatus("Pasted · press Enter to send");
   }, { capture: true });
   terminal.onData((data) => {
+    if (state.shiftInput?.handleCompositionData(data)) return;
     const reply = terminalReplyGate.receive(new TextEncoder().encode(data));
     if (reply && state.socket?.readyState === WebSocket.OPEN) state.socket.send(reply);
   });
@@ -3229,6 +3288,10 @@ function renderTerminal(id: string, workflowID?: string): void {
     if (reply && state.socket?.readyState === WebSocket.OPEN) state.socket.send(reply);
   });
   const applyInputMode = (mode: TerminalInputMode, persist: boolean): void => {
+    if (persist) {
+      state.keyboardControls?.reset();
+      state.shiftInput?.reset();
+    }
     page.dataset.inputMode = mode;
     const direct = mode === "direct";
     inputModeButton.textContent = direct ? "Version 2" : "Version 1";
@@ -3851,7 +3914,7 @@ function enableTouchScroll(
   };
 }
 
-function renderTerminalComposer(): HTMLElement {
+function renderTerminalComposer(shift: TerminalShift): HTMLElement {
   const section = el("section", "terminal-composer");
   section.dataset.connected = "false";
   const attachmentList = el("div", "terminal-attachment-list");
@@ -3990,31 +4053,60 @@ function renderTerminalComposer(): HTMLElement {
     chooseAttachments(direct);
   });
 
-  section.append(renderExtraKeys(input), panel, status);
+  const keyboard = createTerminalKeyboard({
+    shift,
+    send: sendTerminalInput,
+    applicationCursor: () => state.terminal?.modes.applicationCursorKeysMode ?? false,
+    status: setTerminalInputStatus,
+    resize: () => window.requestAnimationFrame(fitTerminal),
+  });
+  const shiftButton = el("button", "key-button terminal-shift-button terminal-control-key", "Shift");
+  shiftButton.type = "button";
+  shiftButton.disabled = true;
+  shiftButton.title = "Shift for the next key";
+  const unsubscribeShift = shift.subscribe(() => shiftButton.setAttribute("aria-pressed", String(shift.active)));
+  shiftButton.addEventListener("pointerdown", (event) => event.preventDefault());
+  shiftButton.addEventListener("click", () => shift.toggle());
+  state.keyboardControls = {
+    ...keyboard,
+    dispose: () => { unsubscribeShift(); keyboard.dispose(); },
+  };
+  const controls = el("div", "terminal-input-controls");
+  const tabButton = renderTerminalShortcut("Tab", "Tab", input, shift);
+  tabButton.classList.add("terminal-tab-key");
+  controls.append(keyboard.button, shiftButton, tabButton, renderExtraKeys(input, shift));
+  section.append(controls, keyboard.panel, panel, status);
   return section;
 }
 
-function renderExtraKeys(focusTarget?: HTMLElement): HTMLElement {
+function renderExtraKeys(focusTarget: HTMLElement, shift: TerminalShift): HTMLElement {
   const bar = el("div", "extra-keys");
   const keys: Array<[string, string, string?]> = [
-    ["\r", "Enter"], ["\u001b", "Esc"], ["\t", "Tab"], ["\u0003", "Ctrl C"], ["\u0004", "Ctrl D"],
-    ["\u001b[5~", "PgUp", "terminal-page-navigation-key"], ["\u001b[6~", "PgDn", "terminal-page-navigation-key"],
-    ["\u001b[A", "↑"], ["\u001b[B", "↓"], ["\u001b[D", "←"], ["\u001b[C", "→"],
+    ["Enter", "Enter"], ["Escape", "Esc"], ["c", "Ctrl C"], ["d", "Ctrl D"],
+    ["PageUp", "PgUp", "terminal-page-navigation-key"], ["PageDown", "PgDn", "terminal-page-navigation-key"],
+    ["ArrowUp", "↑"], ["ArrowDown", "↓"], ["ArrowLeft", "←"], ["ArrowRight", "→"],
   ];
   for (const [value, label, className] of keys) {
-    const button = el("button", "key-button", label);
-    button.type = "button";
-    button.classList.add("terminal-control-key");
+    const button = renderTerminalShortcut(value, label, focusTarget, shift);
     if (className) button.classList.add(className);
-    button.disabled = true;
-    button.addEventListener("pointerdown", (event) => event.preventDefault());
-    button.addEventListener("click", () => {
-      sendTerminalInput(value);
-      focusTarget?.focus();
-    });
     bar.append(button);
   }
   return bar;
+}
+
+function renderTerminalShortcut(value: string, label: string, focusTarget: HTMLElement, shift: TerminalShift): HTMLButtonElement {
+  const button = el("button", "key-button terminal-control-key", label);
+  button.type = "button";
+  button.disabled = true;
+  button.addEventListener("pointerdown", (event) => event.preventDefault());
+  button.addEventListener("click", () => {
+    const data = terminalKeyboardInput(value, { shift: shift.active, ctrl: label.startsWith("Ctrl "), alt: false, meta: false, caps: false }, state.terminal?.modes.applicationCursorKeysMode);
+    if (sendTerminalInput(data)) shift.set(false);
+    // Tab also stays visible with App Keyboard open. Only refocus a visible
+    // composer, so tapping Tab does not reopen the device keyboard.
+    if (focusTarget.getClientRects().length) focusTarget.focus({ preventScroll: true });
+  });
+  return button;
 }
 
 function sendTerminalInput(value: string): boolean {
@@ -4291,6 +4383,8 @@ function setConnectionState(label: string, kind: "connecting" | "online" | "offl
   const composer = document.querySelector<HTMLElement>(".terminal-composer");
   if (!composer) return;
   const connected = kind === "online";
+  state.keyboardControls?.setConnected(connected);
+  if (!connected) state.shiftInput?.reset();
   composer.dataset.connected = String(connected);
   const input = composer.querySelector<HTMLTextAreaElement>(".terminal-composer-input");
   const send = composer.querySelector<HTMLButtonElement>(".terminal-composer-send");
@@ -4303,6 +4397,11 @@ function setConnectionState(label: string, kind: "connecting" | "online" | "offl
 }
 
 function closeConnection(): void {
+  state.keyboardControls?.reset();
+  state.keyboardControls?.dispose();
+  state.keyboardControls = undefined;
+  state.shiftInput?.dispose();
+  state.shiftInput = undefined;
   if (state.desktop) {
     try { state.desktop.disconnect(); } catch { /* The stream may already be closed. */ }
   }

@@ -1,0 +1,40 @@
+import assert from "node:assert/strict";
+import { keyboardCharacter, parseKeyboardLayout, terminalKeyboardInput, type KeyboardModifiers } from "./terminal-keyboard";
+
+const plain: KeyboardModifiers = { shift: false, ctrl: false, alt: false, meta: false, caps: false };
+assert.equal(parseKeyboardLayout("windows"), "windows");
+assert.equal(parseKeyboardLayout("mac"), "mac");
+assert.equal(parseKeyboardLayout(null), "mac");
+assert.equal(parseKeyboardLayout("invalid"), "mac");
+assert.equal(terminalKeyboardInput("c", { ...plain, ctrl: true }), "\x03");
+assert.equal(terminalKeyboardInput("d", { ...plain, ctrl: true }), "\x04");
+assert.equal(terminalKeyboardInput("Space", { ...plain, ctrl: true }), "\x00");
+assert.equal(terminalKeyboardInput("[", { ...plain, ctrl: true }), "\x1b");
+assert.equal(terminalKeyboardInput("c", { ...plain, ctrl: true, shift: true }), "\x03");
+assert.equal(terminalKeyboardInput("b", { ...plain, alt: true }), "\x1bb");
+assert.equal(terminalKeyboardInput("b", { ...plain, meta: true }), "\x1bb");
+assert.equal(terminalKeyboardInput("x", { ...plain, alt: true, meta: true }), "\x1bx");
+assert.equal(terminalKeyboardInput("a", plain), "a");
+assert.equal(keyboardCharacter("a", { ...plain, shift: true }), "A");
+assert.equal(keyboardCharacter("a", { ...plain, caps: true }), "A");
+assert.equal(keyboardCharacter("a", { ...plain, shift: true, caps: true }), "a");
+for (const [key, expected] of [["1", "!"], ["2", "@"], ["'", '"'], ["\\", "|"], ["/", "?"]] as const) {
+  assert.equal(terminalKeyboardInput(key, { ...plain, shift: true }), expected);
+  assert.equal(terminalKeyboardInput(key, { ...plain, caps: true }), key);
+}
+assert.equal(terminalKeyboardInput("Enter", plain), "\r");
+assert.equal(terminalKeyboardInput("Backspace", plain), "\x7f");
+assert.equal(terminalKeyboardInput("Delete", plain), "\x1b[3~");
+assert.equal(terminalKeyboardInput("Tab", plain), "\t");
+assert.equal(terminalKeyboardInput("Tab", { ...plain, shift: true }), "\x1b[Z");
+assert.equal(terminalKeyboardInput("ArrowUp", plain), "\x1b[A");
+assert.equal(terminalKeyboardInput("ArrowUp", plain, true), "\x1bOA");
+assert.equal(terminalKeyboardInput("ArrowLeft", { ...plain, ctrl: true }, true), "\x1b[1;5D");
+assert.equal(terminalKeyboardInput("Home", plain, true), "\x1bOH");
+assert.equal(terminalKeyboardInput("End", plain), "\x1b[F");
+assert.equal(terminalKeyboardInput("PageUp", plain), "\x1b[5~");
+assert.equal(terminalKeyboardInput("PageDown", { ...plain, shift: true }), "\x1b[6;2~");
+assert.equal(terminalKeyboardInput("F1", plain), "\x1bOP");
+assert.equal(terminalKeyboardInput("F4", { ...plain, alt: true }), "\x1b[1;3S");
+assert.equal(terminalKeyboardInput("F12", plain), "\x1b[24~");
+console.log("terminal app keyboard mappings passed");
