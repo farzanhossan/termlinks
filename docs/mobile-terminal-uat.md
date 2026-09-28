@@ -1,5 +1,27 @@
 # Mobile terminal interaction verification
 
+## 2026-09-15: App Keyboard display and connection recovery
+
+- Automated regressions run the production input, encrypted bridge, heartbeat,
+  and terminal reconnect functions. They cover offscreen prompt updates with
+  real xterm, failed sends, one outstanding heartbeat, stale callbacks, snapshot
+  timeouts, increasing retry delays, and cleanup after failed restoration.
+- Isolated headless Chrome verification used the responsive 390px keyboard,
+  real xterm and mobile scroll handlers, synthetic touch pointer events, and
+  simulated terminal output. Tapping Backspace then typing, holding/releasing
+  Backspace, deleting wrapped lines, alternate-screen input, and hiding/reopening
+  the keyboard all kept the expected text visible without duplicate input.
+- Browser verification used normal timing. Chrome's virtual-time run did not
+  repaint reliably in this macOS environment and was not used as passing evidence.
+- Frontend tests, typecheck, production web build, and `git diff --check` passed.
+- Physical Android Chrome/PWA and the deployed encrypted portal remain unverified.
+  Repeat the same gestures in a shell, Claude Code, and Codex, then switch apps
+  and interrupt/restore the network. Confirm the same session returns, output
+  catches up, and uncertain keystrokes are not replayed. Network outages may still
+  produce a reconnect indicator; recovery must not stay stuck after service returns.
+
+## 2026-09-05/06: Earlier mobile interaction checks
+
 Local verification on 2026-09-05/06 used Chrome through browser automation,
 a 390×844 viewport, the actual responsive terminal handler, an isolated
 Termlinks daemon, and real persistent Zsh and Claude sessions.

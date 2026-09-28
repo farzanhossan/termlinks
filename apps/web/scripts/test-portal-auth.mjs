@@ -39,6 +39,7 @@ function fixture() {
     // Deliberately let an outstanding handshake settle after close: cancellation
     // must remain safe even when the async operation has already completed.
     close() { this.closed = true; }
+    isReady() { return !this.closed; }
   }
   const context = vm.createContext({
     encryptedPortal: true, portalResumeKey: "saved-key", portalDeviceID: "saved-device",
@@ -120,6 +121,21 @@ async function manualLogin(context) {
   context.state.authenticated = false; context.encryptedBridge = undefined;
   await context.resumeEncryptedPortal();
   assert.equal(context.state.authenticated, true);
+}
+
+// A bridge authenticated before a failed session refresh must be closed rather
+// than orphaned while the next restoration opens another channel.
+{
+  const { context, attempts } = fixture();
+  context.loadSessions = async () => { throw new Error("connection interrupted"); };
+  await context.resumeEncryptedPortal();
+  assert.equal(attempts[0].bridge.closed, true);
+  assert.equal(context.encryptedBridge, undefined);
+  assert.equal(context.state.authenticated, false);
+  context.loadSessions = async () => {};
+  await context.resumeEncryptedPortal();
+  assert.equal(context.state.authenticated, true);
+  assert.equal(attempts.length, 2);
 }
 
 console.log("portal manual-login and reconnect coordination passed");

@@ -7,7 +7,7 @@
     "dev": "node scripts/build.mjs --serve",
     "build": "tsc --noEmit && node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node scripts/test-terminal-history.mjs && node scripts/test-portal-auth.mjs && node scripts/test-profile-menu.mjs"
+    "test": "node scripts/test-terminal-history.mjs && node scripts/test-terminal-connection.mjs && node scripts/test-portal-auth.mjs && node scripts/test-profile-menu.mjs"
   },
   "dependencies": {
     "@novnc/novnc": "1.7.0",
